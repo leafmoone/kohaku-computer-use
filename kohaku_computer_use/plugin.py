@@ -119,6 +119,7 @@ class ComputerUsePlugin(BasePlugin):
                      await asyncio.to_thread(BROKER.approve, context, state_id, actions, generation, title))
             return {**clean, '_approval_token': token}
         except BrokerError as exc:
+            log.info('Computer-use preflight blocked %s (%s): %s', tool, label, exc)
             BROKER.record_block(label, str(exc))
             raise PluginBlockError(str(exc)) from exc
         except Exception as exc:

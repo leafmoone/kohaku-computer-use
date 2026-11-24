@@ -136,7 +136,9 @@ def omit_optional_nulls(value: object, node: dict) -> object:
 
 
 def validate_args(tool: str, args: dict) -> dict:
-    normalized = omit_optional_nulls(args, STRICT_SCHEMAS[tool])
+    # KT SubAgent retains this metadata on the original call to pair its result.
+    clean_input = {key: value for key, value in args.items() if key != '_tool_call_id'} if isinstance(args, dict) else args
+    normalized = omit_optional_nulls(clean_input, STRICT_SCHEMAS[tool])
     error = next(VALIDATORS[tool].iter_errors(normalized), None)
     if error is not None:
         path = '.'.join(str(part) for part in error.absolute_path) or 'arguments'
