@@ -4,7 +4,6 @@ from __future__ import annotations
 import atexit
 import base64
 import json
-import logging
 import os
 import queue
 import re
@@ -20,6 +19,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, get_args
 from uuid import uuid4
 from weakref import ReferenceType, ref
+
+from kohakuterrarium.utils.logging import get_logger
 
 from . import cdp
 from .models import (
@@ -53,7 +54,7 @@ from .models import (
 if TYPE_CHECKING:
     from kohakuterrarium.modules.tool.base import ToolContext
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 CALL_TIMEOUT = 12.0
 HOTKEY_READY_TIMEOUT = 2.5
 OPERATOR = 'operator'

@@ -72,19 +72,12 @@ STRICT_SCHEMAS = {
     'cu_delegate': schema({'task': {**string(2000, True), 'description': 'Bounded GUI task and expected result.'},
                            'max_steps': {**integer(1, 12), 'description': 'Maximum turns (defaults to 6).'}}, ['task']),
 }
-PROVIDER_SCHEMA_KEYS = frozenset({
-    'type', 'properties', 'required', 'items', 'enum', 'description', 'minimum', 'maximum',
-    'minItems', 'maxItems', 'additionalProperties',
-})
-MAX_SAFE_JSON_INTEGER = 2**53 - 1
+PROVIDER_SCHEMA_KEYS = frozenset({'type', 'properties', 'required', 'items', 'enum', 'description'})
 
 
 def provider_schema(node: dict) -> dict:
     result = {key: deepcopy(value) for key, value in node.items()
               if key in PROVIDER_SCHEMA_KEYS and key not in ('properties', 'items')}
-    if result.get('maximum', 0) > MAX_SAFE_JSON_INTEGER:
-        # Keep full-width HWND validation local; some providers parse JSON numbers as doubles.
-        del result['maximum']
     if 'properties' in node:
         result['properties'] = {key: provider_schema(value) for key, value in node['properties'].items()}
     if 'items' in node:
@@ -108,7 +101,7 @@ DOCS = {
                   'A new URL may open a tab and require confirmation. Use the returned state and @eN references.',
     'cu_query': 'Pass state_id. Filter by ref, exact role (case-insensitive) or text substring; optionally pass limit.',
     'cu_act': 'Pass state_id and actions (1–8 objects, each with action). Prefer @eN ref from that exact state. '
-              'invoke, set_text, toggle, select, expand and collapse require ref. scroll takes direction and optional amount. '
+              'invoke, set_text, toggle, select, expand and collapse require ref. scroll takes direction, optional amount, and optionally a ref or x/y. '
               'click, double_click and right_click take ref or x/y (desktop pixels for windows; viewport CSS pixels for CDP). '
               'CDP supports click, invoke, double_click, right_click, set_text, type_text, key and scroll. type_text takes text and optional '
               'ref and clear_first; set_text takes text; key takes a chord such as Ctrl+A. '
@@ -135,10 +128,70 @@ def omit_optional_nulls(value: object, node: dict) -> object:
     return value
 
 
+REF_ACTIONS = {'invoke', 'set_text', 'toggle', 'select', 'expand', 'collapse'}
+TEXT_ACTIONS = {'set_text', 'type_text'}
+CLICK_ACTIONS = {'click', 'double_click', 'right_click'}
+ACTION_FIELDS = {
+    **{name: {'ref'} for name in REF_ACTIONS},
+    **{name: {'ref', 'text', 'clear_first'} for name in TEXT_ACTIONS},
+    **{name: {'ref', 'x', 'y'} for name in CLICK_ACTIONS},
+    'key': {'key'},
+    'scroll': {'ref', 'x', 'y', 'direction', 'amount'},
+}
+
+
+def blank(value: object) -> bool:
+    return isinstance(value, str) and not value.strip()
+
+
+def normalize_action(item: dict) -> dict:
+    name = item.get('action')
+    if not isinstance(name, str) or name not in ACTION_FIELDS:
+        return item
+    active = ACTION_FIELDS[name] | {'action', 'expect', 'wait_ms'}
+    # Keep unknown fields so the strict schema can still flag them.
+    item = {key: value for key, value in item.items() if key in active or key not in ACTION['properties']}
+    if blank(item.get('ref')):
+        item.pop('ref')
+    if 'ref' in item and (name in CLICK_ACTIONS or name == 'scroll'):
+        item.pop('x', None)
+        item.pop('y', None)
+    if name == 'scroll' and type(item.get('amount')) is int and item['amount'] < 1:
+        item.pop('amount')
+    if isinstance(expect := item.get('expect'), dict):
+        expect = {key: value for key, value in expect.items() if key not in ('text', 'role') or not blank(value)}
+        if {'text', 'role'} & expect.keys() or expect.keys() - EXPECT['properties'].keys():
+            item['expect'] = expect
+        else:
+            item.pop('expect')
+    return item
+
+
+def normalize_placeholders(tool: str, args: dict) -> dict:
+    strings, number = {
+        'cu_observe': (('root_ref', 'query', 'url'), 'max_elements'),
+        'cu_query': (('ref', 'text', 'role'), 'limit'),
+        'cu_delegate': ((), 'max_steps'),
+    }.get(tool, ((), ''))
+    for key in strings:
+        if blank(args.get(key)):
+            args.pop(key)
+    if number and type(args.get(number)) is int and args[number] == 0:
+        args.pop(number)
+    if (tool == 'cu_observe' and type(hwnd := args.get('hwnd')) is int
+            and (hwnd == 0 or (hwnd == 1 and any(args.get(key) for key in strings)))):
+        args.pop('hwnd')
+    if tool == 'cu_act' and isinstance(actions := args.get('actions'), list):
+        args['actions'] = [normalize_action(item) if isinstance(item, dict) else item for item in actions]
+    return args
+
+
 def validate_args(tool: str, args: dict) -> dict:
     # KT SubAgent retains this metadata on the original call to pair its result.
     clean_input = {key: value for key, value in args.items() if key != '_tool_call_id'} if isinstance(args, dict) else args
     normalized = omit_optional_nulls(clean_input, STRICT_SCHEMAS[tool])
+    if isinstance(normalized, dict):
+        normalized = normalize_placeholders(tool, normalized)
     error = next(VALIDATORS[tool].iter_errors(normalized), None)
     if error is not None:
         path = '.'.join(str(part) for part in error.absolute_path) or 'arguments'
@@ -155,17 +208,15 @@ def validate_args(tool: str, args: dict) -> dict:
     for item in args['actions']:
         name = item['action']
         coords = 'x' in item or 'y' in item
-        if coords and ('ref' in item or not {'x', 'y'} <= item.keys() or name not in ('click', 'double_click', 'right_click')):
-            raise BrokerError(422, 'click_coordinates_must_be_a_pair_without_ref', 'blocked')
-        if name in ('invoke', 'set_text', 'toggle', 'select', 'expand', 'collapse') and 'ref' not in item:
+        if coords and not {'x', 'y'} <= item.keys():
+            raise BrokerError(422, 'coordinates_must_be_a_pair', 'blocked')
+        if name in REF_ACTIONS and 'ref' not in item:
             raise BrokerError(422, 'semantic_action_requires_ref', 'blocked')
-        if name in ('click', 'double_click', 'right_click') and not (coords or 'ref' in item):
+        if name in CLICK_ACTIONS and not (coords or 'ref' in item):
             raise BrokerError(422, 'click_requires_ref_or_coordinates', 'blocked')
-        for field, permitted in [('text', ('set_text', 'type_text')), ('key', ('key',)), ('direction', ('scroll',))]:
-            if (name in permitted) != (field in item):
+        for field, required_by in [('text', TEXT_ACTIONS), ('key', {'key'}), ('direction', {'scroll'})]:
+            if name in required_by and field not in item:
                 raise BrokerError(422, f'invalid_{field}_for_action', 'blocked')
-        if ('amount' in item and name != 'scroll') or ('clear_first' in item and name not in ('set_text', 'type_text')):
-            raise BrokerError(422, 'action_argument_not_applicable', 'blocked')
         if 'text' in item:
             try:
                 item['text'].encode('utf-16-le')
@@ -178,8 +229,6 @@ def validate_args(tool: str, args: dict) -> dict:
                 raise BrokerError(422, 'invalid_key_chord', 'blocked') from exc
         if 'expect' in item:
             expect = item['expect']
-            if not ({'text', 'role'} & expect.keys()):
-                raise BrokerError(422, 'expect_requires_text_or_role', 'blocked')
             if 'timeout_ms' in expect and not isinstance(expect['timeout_ms'], int):
                 raise BrokerError(422, 'timeout_ms_must_be_integer', 'blocked')
         # The JSON Schema integer type also accepts numerically integral floats.

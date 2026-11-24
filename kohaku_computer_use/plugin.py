@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from uuid import uuid4
 
 from kohakuterrarium.modules.output.event import OutputEvent
@@ -12,11 +11,12 @@ from kohakuterrarium.modules.plugin.base import (
     PluginContext,
 )
 from kohakuterrarium.modules.tool.base import BaseTool
+from kohakuterrarium.utils.logging import get_logger
 
 from .broker import BROKER, BrokerError, runtime_session_id
 from .tools import DESCRIPTIONS, DOCS, ComputerUseTool, serialize, validate_args
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 class ComputerUsePlugin(BasePlugin):
