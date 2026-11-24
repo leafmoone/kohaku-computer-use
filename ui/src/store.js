@@ -1,7 +1,14 @@
 import { reactive, watch } from "vue"
 import { notify, useLocale } from "@kohakuterrarium/ui-sdk"
 import { tForLocale } from "./i18n.js"
-import { extractApiError, isValidMode } from "./utils.js"
+import {
+  DEFAULT_CDP_PORTS,
+  extractApiError,
+  isValidMode,
+  normalizeDesktopEffort,
+  parsePortsText,
+  readStatusField,
+} from "./utils.js"
 
 const POLL_INTERVAL_MS = 3000
 const WORK_DEBOUNCE_MS = 250
@@ -40,7 +47,12 @@ export function createCuStore(kt) {
     loadingRoots: false,
     loadingObserve: false,
     loadingStates: false,
+    loadingModels: false,
     savingPolicy: false,
+    models: [],
+    desktopModel: "",
+    desktopReasoningEffort: "low",
+    cdpPorts: [...DEFAULT_CDP_PORTS],
     lastIdleSeconds: 300,
     restoreOnObserve: false,
     error: "",
@@ -54,6 +66,7 @@ export function createCuStore(kt) {
   let statusRequestSeq = 0
   let policyWriteCount = 0
   let panicEpoch = 0
+  let userMutatedPolicy = false
   const stopHandles = []
 
   function beginPolicyWrite() {
@@ -102,9 +115,21 @@ export function createCuStore(kt) {
     const opts = options && typeof options === "object" ? options : {}
     if (state.disposed || !payload || typeof payload !== "object") return
     const previousLatestId = state.status ? state.status.latest_state_id : null
-    const rawIdle = Number(payload.idle_timeout_s)
+    const rawIdle = Number(readStatusField(payload, "idle_timeout_s", 0))
     if (Number.isFinite(rawIdle) && rawIdle > 0) {
       state.lastIdleSeconds = Math.round(rawIdle)
+    }
+    const rawModel = readStatusField(payload, "desktop_model", undefined)
+    if (typeof rawModel === "string") {
+      state.desktopModel = rawModel
+    }
+    const rawEffort = readStatusField(payload, "desktop_reasoning_effort", undefined)
+    if (typeof rawEffort === "string") {
+      state.desktopReasoningEffort = normalizeDesktopEffort(rawEffort)
+    }
+    const rawPorts = readStatusField(payload, "cdp_ports", undefined)
+    if (Array.isArray(rawPorts)) {
+      state.cdpPorts = parsePortsText(rawPorts.join(","))
     }
     state.status = payload
     state.lastSyncedAt = Date.now()
@@ -151,6 +176,57 @@ export function createCuStore(kt) {
     }
   }
 
+  async function persistPolicyPreferences(payload) {
+    if (!kt.preferences || typeof kt.preferences.set !== "function") return
+    const src = payload && typeof payload === "object" ? payload : {}
+    const record = {
+      desktop_model:
+        typeof readStatusField(src, "desktop_model", undefined) === "string"
+          ? readStatusField(src, "desktop_model", "")
+          : state.desktopModel,
+      desktop_reasoning_effort: normalizeDesktopEffort(
+        readStatusField(src, "desktop_reasoning_effort", state.desktopReasoningEffort),
+      ),
+      cdp_ports: Array.isArray(readStatusField(src, "cdp_ports", undefined))
+        ? parsePortsText(readStatusField(src, "cdp_ports", []).join(","))
+        : [...state.cdpPorts],
+      idle_timeout_s: Number.isFinite(Number(readStatusField(src, "idle_timeout_s", undefined)))
+        ? Math.max(0, Math.min(3600, Math.round(Number(readStatusField(src, "idle_timeout_s", 0)))))
+        : 0,
+      denylist_patterns: Array.isArray(readStatusField(src, "denylist_patterns", undefined))
+        ? [...readStatusField(src, "denylist_patterns", [])]
+        : [],
+    }
+    try {
+      await kt.preferences.set("policy", record)
+    } catch (_err) {
+      // Preference persistence is best-effort when storage is unavailable.
+    }
+  }
+
+  async function fetchModels(options) {
+    const opts = options && typeof options === "object" ? options : {}
+    if (state.disposed) return { ok: false, error: "Store disposed" }
+    state.loadingModels = true
+    try {
+      const resp = await kt.api.get("/models")
+      if (state.disposed) return { ok: true, data: resp.data }
+      const list = Array.isArray(resp.data && resp.data.models) ? resp.data.models : []
+      state.models = list
+      if (!opts.silent) state.error = ""
+      return { ok: true, data: list }
+    } catch (err) {
+      const msg = extractApiError(err, "GET /models")
+      if (!state.disposed) {
+        state.error = msg
+        if (!opts.silent) notify(msg, "error")
+      }
+      return { ok: false, error: msg }
+    } finally {
+      state.loadingModels = false
+    }
+  }
+
   async function setPolicy(patch) {
     if (state.disposed) return { ok: false, error: "Store disposed" }
     if (!patch || typeof patch !== "object") {
@@ -165,6 +241,7 @@ export function createCuStore(kt) {
       notify(msg, "error")
       return { ok: false, error: msg }
     }
+    userMutatedPolicy = true
     state.error = ""
     beginPolicyWrite()
     statusRequestSeq += 1
@@ -176,6 +253,15 @@ export function createCuStore(kt) {
         return { ok: false, error: "Superseded by emergency lock", data: resp.data }
       }
       applyStatus(resp.data, { clearError: true })
+      if (
+        patch.desktop_model !== undefined ||
+        patch.desktop_reasoning_effort !== undefined ||
+        patch.cdp_ports !== undefined ||
+        patch.idle_timeout_s !== undefined ||
+        patch.denylist_patterns !== undefined
+      ) {
+        void persistPolicyPreferences(resp.data)
+      }
       if (patch.mode !== undefined) {
         const loc = activeLocale()
         const actualMode = resp.data && resp.data.mode ? resp.data.mode : "locked"
@@ -395,9 +481,11 @@ export function createCuStore(kt) {
       : null
     const payload = {
       root_ref: trimmedRef,
-      hwnd: matchedRoot ? matchedRoot.hwnd : null,
       include_image: Boolean(includeImage),
       restore: Boolean(state.restoreOnObserve),
+    }
+    if (matchedRoot && matchedRoot.kind !== "cdp" && Number(matchedRoot.hwnd) > 0) {
+      payload.hwnd = Number(matchedRoot.hwnd)
     }
     state.loadingObserve = true
     try {
@@ -576,13 +664,66 @@ export function createCuStore(kt) {
     }
   }
 
-  void fetchStatus({ silent: true })
+  async function initStore() {
+    await fetchStatus({ silent: true })
+    if (state.disposed) return
+    if (kt.preferences && typeof kt.preferences.get === "function") {
+      try {
+        const saved = await kt.preferences.get("policy", null)
+        if (saved && typeof saved === "object" && !state.disposed && !userMutatedPolicy) {
+          const syncPatch = {}
+          if (typeof saved.desktop_model === "string" && saved.desktop_model !== state.desktopModel) {
+            syncPatch.desktop_model = saved.desktop_model
+            state.desktopModel = saved.desktop_model
+          }
+          if (typeof saved.desktop_reasoning_effort === "string") {
+            const effort = normalizeDesktopEffort(saved.desktop_reasoning_effort)
+            if (effort !== state.desktopReasoningEffort) {
+              syncPatch.desktop_reasoning_effort = effort
+              state.desktopReasoningEffort = effort
+            }
+          }
+          if (Array.isArray(saved.cdp_ports)) {
+            const ports = parsePortsText(saved.cdp_ports.join(","))
+            if (JSON.stringify(ports) !== JSON.stringify(state.cdpPorts)) {
+              syncPatch.cdp_ports = ports
+              state.cdpPorts = ports
+            }
+          }
+          if (Number.isFinite(Number(saved.idle_timeout_s))) {
+            const sec = Math.max(0, Math.min(3600, Math.round(Number(saved.idle_timeout_s))))
+            const currentSec = Number(readStatusField(state.status, "idle_timeout_s", 0))
+            if (sec !== currentSec) {
+              syncPatch.idle_timeout_s = sec
+            }
+          }
+          if (Array.isArray(saved.denylist_patterns)) {
+            const currentDeny = readStatusField(state.status, "denylist_patterns", [])
+            if (JSON.stringify(saved.denylist_patterns) !== JSON.stringify(currentDeny)) {
+              syncPatch.denylist_patterns = saved.denylist_patterns
+            }
+          }
+          if (Object.keys(syncPatch).length > 0 && !state.disposed) {
+            await setPolicy(syncPatch)
+          }
+        }
+      } catch (_err) {
+        // Ignore preference hydration errors on startup.
+      }
+    }
+    if (!state.disposed) {
+      void fetchModels({ silent: true })
+    }
+  }
+
+  void initStore()
 
   return {
     kt,
     state,
     clearError,
     fetchStatus,
+    fetchModels,
     setPolicy,
     toggleIdleAutoLock,
     triggerPanic,

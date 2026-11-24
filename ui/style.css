@@ -636,6 +636,80 @@ html.dark .kcu-mode-panic-hint {
   min-width: 200px;
 }
 
+.kcu-select-compact {
+  flex: 0 1 auto;
+  min-width: 210px;
+  max-width: 320px;
+}
+
+.kcu-input-ports {
+  width: 170px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+
+.kcu-roots-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.kcu-root-chip {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  max-width: 320px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--kcu-border);
+  background: var(--kcu-panel);
+  color: var(--kcu-text);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.kcu-root-chip.is-active {
+  border-color: var(--kcu-accent);
+  background: var(--kcu-surface);
+}
+
+.kcu-root-chip-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+}
+
+.kcu-root-chip-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kcu-root-chip-sub {
+  color: var(--kcu-text-muted);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kcu-badge-cdp {
+  --kcu-state-fg: #0e7490;
+  --kcu-state-bg: rgba(14, 116, 144, 0.14);
+  --kcu-state-border: rgba(14, 116, 144, 0.42);
+}
+
+html.dark .kcu-badge-cdp {
+  --kcu-state-fg: #38bdf8;
+  --kcu-state-bg: rgba(56, 189, 248, 0.16);
+  --kcu-state-border: rgba(56, 189, 248, 0.44);
+}
+
 .kcu-input {
   width: 100%;
 }

@@ -9,36 +9,60 @@ import {
 import { syncSettingsHostLabels, useI18n } from "./i18n.js"
 import { getCuStore } from "./store.js"
 import {
+  DEFAULT_CDP_PORTS,
   DEFAULT_DENYLIST_PATTERNS,
   MODES,
+  formatPortsList,
+  groupModelsByProvider,
   joinPatternLines,
   modeBadgeKey,
+  normalizeDesktopEffort,
+  readStatusField,
   splitPatternLines,
   statusTone,
+  validatePortsText,
   validateRegexPatterns,
 } from "./utils.js"
 
-function buildDraftFromStatus(status, fallbackSeconds) {
-  const rawTimeout = status ? Number(status.idle_timeout_s) : 0
+function buildDraftFromStatus(status, fallbackSeconds, storeState) {
+  const rawTimeout = status ? Number(readStatusField(status, "idle_timeout_s", 0)) : 0
   const idleEnabled = Boolean(Number.isFinite(rawTimeout) && rawTimeout > 0)
   const duration = idleEnabled
     ? Math.round(rawTimeout)
     : Number.isFinite(Number(fallbackSeconds)) && Number(fallbackSeconds) > 0
       ? Math.round(Number(fallbackSeconds))
       : 300
+  const desktopModel = readStatusField(
+    status,
+    "desktop_model",
+    storeState ? storeState.desktopModel : "",
+  )
+  const desktopEffort = readStatusField(
+    status,
+    "desktop_reasoning_effort",
+    storeState ? storeState.desktopReasoningEffort : "low",
+  )
+  const cdpPorts = readStatusField(
+    status,
+    "cdp_ports",
+    storeState ? storeState.cdpPorts : DEFAULT_CDP_PORTS,
+  )
+  const denylist = readStatusField(status, "denylist_patterns", DEFAULT_DENYLIST_PATTERNS)
+  const allowlist = readStatusField(status, "allowlist_patterns", [])
   return {
     idleEnabled,
     idleTimeoutText: String(duration),
-    allowForegroundInput: status ? status.allow_foreground_input !== false : true,
+    allowForegroundInput: status
+      ? readStatusField(status, "allow_foreground_input", true) !== false
+      : true,
     hotkey: status && status.hotkey ? String(status.hotkey) : "Ctrl+Alt+F12",
+    desktopModel: typeof desktopModel === "string" ? desktopModel : "",
+    desktopReasoningEffort: normalizeDesktopEffort(desktopEffort),
+    cdpPortsText: formatPortsList(Array.isArray(cdpPorts) ? cdpPorts : DEFAULT_CDP_PORTS),
     denylistText: joinPatternLines(
-      status && Array.isArray(status.denylist_patterns)
-        ? status.denylist_patterns
-        : DEFAULT_DENYLIST_PATTERNS,
+      Array.isArray(denylist) ? denylist : DEFAULT_DENYLIST_PATTERNS,
     ),
-    allowlistText: joinPatternLines(
-      status && Array.isArray(status.allowlist_patterns) ? status.allowlist_patterns : [],
-    ),
+    allowlistText: joinPatternLines(Array.isArray(allowlist) ? allowlist : []),
   }
 }
 
@@ -49,15 +73,20 @@ export default defineComponent({
     const store = getCuStore(kt)
     const { locale, t } = useI18n()
 
-    const draft = reactive(buildDraftFromStatus(store.state.status, store.state.lastIdleSeconds))
+    const draft = reactive(
+      buildDraftFromStatus(store.state.status, store.state.lastIdleSeconds, store.state),
+    )
     const dirty = reactive({ value: false })
 
     function applyStatusToDraft(status) {
-      const next = buildDraftFromStatus(status, store.state.lastIdleSeconds)
+      const next = buildDraftFromStatus(status, store.state.lastIdleSeconds, store.state)
       draft.idleEnabled = next.idleEnabled
       draft.idleTimeoutText = next.idleTimeoutText
       draft.allowForegroundInput = next.allowForegroundInput
       draft.hotkey = next.hotkey
+      draft.desktopModel = next.desktopModel
+      draft.desktopReasoningEffort = next.desktopReasoningEffort
+      draft.cdpPortsText = next.cdpPortsText
       draft.denylistText = next.denylistText
       draft.allowlistText = next.allowlistText
       dirty.value = false
@@ -91,10 +120,19 @@ export default defineComponent({
 
     const hotkeyTrimmed = computed(() => String(draft.hotkey || "").trim())
 
+    const cdpCheck = computed(() => validatePortsText(draft.cdpPortsText))
+    const modelGroups = computed(() => groupModelsByProvider(store.state.models))
+    const hasMissingSavedModel = computed(
+      () =>
+        Boolean(draft.desktopModel) &&
+        !store.state.models.some((item) => item && item.selector === draft.desktopModel),
+    )
+
     const hasValidationError = computed(
       () =>
         (draft.idleEnabled && timeoutNumber.value === null) ||
         !hotkeyTrimmed.value ||
+        !cdpCheck.value.valid ||
         !denylistCheck.value.valid ||
         !allowlistCheck.value.valid,
     )
@@ -121,6 +159,7 @@ export default defineComponent({
 
     onMounted(() => {
       store.enterSettings()
+      void store.fetchModels({ silent: true })
       if (typeof document !== "undefined") {
         syncSettingsHostLabels(locale.value, document)
         void nextTick().then(() => syncSettingsHostLabels(locale.value, document))
@@ -178,6 +217,44 @@ export default defineComponent({
       dirty.value = true
     }
 
+    function onCdpPortsInput(event) {
+      draft.cdpPortsText = event && event.target ? String(event.target.value) : ""
+      dirty.value = true
+    }
+
+    async function onDesktopModelChange(event) {
+      const nextModel = event && event.target ? String(event.target.value) : ""
+      draft.desktopModel = nextModel
+      const res = await store.setPolicy({ desktop_model: nextModel })
+      if (res && res.ok) {
+        if (!dirty.value) applyStatusToDraft(res.data)
+        notify(t("toast.desktopConfigUpdated"), "success")
+      }
+    }
+
+    async function onDesktopEffortChange(event) {
+      const nextEffort = normalizeDesktopEffort(event && event.target ? event.target.value : "low")
+      draft.desktopReasoningEffort = nextEffort
+      const res = await store.setPolicy({ desktop_reasoning_effort: nextEffort })
+      if (res && res.ok) {
+        if (!dirty.value) applyStatusToDraft(res.data)
+        notify(t("toast.desktopConfigUpdated"), "success")
+      }
+    }
+
+    async function saveCdpPorts() {
+      if (!cdpCheck.value.valid) {
+        notify(t("settings.invalidCdpPorts"), "error")
+        return
+      }
+      const res = await store.setPolicy({ cdp_ports: cdpCheck.value.ports })
+      if (res && res.ok) {
+        draft.cdpPortsText = formatPortsList(cdpCheck.value.ports)
+        if (!dirty.value) applyStatusToDraft(res.data)
+        notify(t("toast.desktopConfigUpdated"), "success")
+      }
+    }
+
     function discardChanges() {
       applyStatusToDraft(store.state.status)
     }
@@ -202,10 +279,18 @@ export default defineComponent({
         return
       }
 
+      if (!cdpCheck.value.valid) {
+        notify(t("settings.invalidCdpPorts"), "error")
+        return
+      }
+
       const res = await store.setPolicy({
         idle_timeout_s: draft.idleEnabled ? timeoutNumber.value : 0,
         allow_foreground_input: Boolean(draft.allowForegroundInput),
         hotkey: hotkeyTrimmed.value,
+        desktop_model: String(draft.desktopModel || ""),
+        desktop_reasoning_effort: normalizeDesktopEffort(draft.desktopReasoningEffort),
+        cdp_ports: cdpCheck.value.ports,
         denylist_patterns: splitPatternLines(draft.denylistText),
         allowlist_patterns: splitPatternLines(draft.allowlistText),
       })
@@ -220,6 +305,9 @@ export default defineComponent({
         idle_timeout_s: 0,
         allow_foreground_input: true,
         hotkey: "Ctrl+Alt+F12",
+        desktop_model: "",
+        desktop_reasoning_effort: "low",
+        cdp_ports: [...DEFAULT_CDP_PORTS],
         denylist_patterns: [...DEFAULT_DENYLIST_PATTERNS],
         allowlist_patterns: [],
       })
@@ -450,6 +538,133 @@ export default defineComponent({
                       placeholder: "Ctrl+Alt+F12",
                       onInput: onHotkeyInput,
                     }),
+                },
+              ),
+            ],
+          },
+        ),
+        h(
+          SettingsGroup,
+          {
+            title: t("settings.desktopGroupTitle"),
+            description: t("settings.desktopGroupDesc"),
+          },
+          {
+            action: () =>
+              h(
+                ActionButton,
+                {
+                  variant: "secondary",
+                  size: "sm",
+                  "data-test": "kcu-settings-refresh-models",
+                  disabled: store.state.loadingModels,
+                  onClick: () => void store.fetchModels(),
+                },
+                { default: () => t("settings.refreshModels") },
+              ),
+            default: () => [
+              h(
+                SettingsRow,
+                {
+                  title: t("settings.desktopModelTitle"),
+                  hint: t("settings.desktopModelHint"),
+                },
+                {
+                  default: () =>
+                    h(
+                      "select",
+                      {
+                        class: "kcu-select kcu-select-compact",
+                        "data-test": "kcu-settings-desktop-model",
+                        value: draft.desktopModel,
+                        disabled: store.state.savingPolicy,
+                        onChange: (event) => void onDesktopModelChange(event),
+                      },
+                      [
+                        h("option", { value: "" }, t("settings.desktopModelInherit")),
+                        hasMissingSavedModel.value
+                          ? h(
+                              "option",
+                              { key: `__saved_${draft.desktopModel}`, value: draft.desktopModel },
+                              t("settings.desktopModelSavedSuffix", { model: draft.desktopModel }),
+                            )
+                          : null,
+                        ...modelGroups.value.map((group) =>
+                          h(
+                            "optgroup",
+                            { key: group.provider, label: group.provider },
+                            group.items.map((item) =>
+                              h(
+                                "option",
+                                { key: item.selector, value: item.selector },
+                                item.name ? `${item.name} (${item.selector})` : item.selector,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ].filter(Boolean),
+                    ),
+                },
+              ),
+              h(
+                SettingsRow,
+                {
+                  title: t("settings.desktopEffortTitle"),
+                  hint: t("settings.desktopEffortHint"),
+                  inline: true,
+                },
+                {
+                  default: () =>
+                    h(
+                      "select",
+                      {
+                        class: "kcu-select kcu-select-compact",
+                        "data-test": "kcu-settings-desktop-effort",
+                        value: draft.desktopReasoningEffort,
+                        disabled: store.state.savingPolicy,
+                        onChange: (event) => void onDesktopEffortChange(event),
+                      },
+                      [
+                        h("option", { value: "low" }, t("settings.effortLowRec")),
+                        h("option", { value: "minimal" }, t("effort.minimal")),
+                        h("option", { value: "medium" }, t("effort.medium")),
+                        h("option", { value: "high" }, t("effort.high")),
+                        h("option", { value: "inherit" }, t("settings.effortInherit")),
+                      ],
+                    ),
+                },
+              ),
+              h(
+                SettingsRow,
+                {
+                  title: t("settings.cdpPortsTitle"),
+                  hint: t("settings.cdpPortsHint"),
+                  status: !cdpCheck.value.valid ? t("settings.invalidCdpPorts") : "",
+                  tone: !cdpCheck.value.valid ? "error" : "muted",
+                },
+                {
+                  default: () =>
+                    h("div", { class: "kcu-input-inline" }, [
+                      h("input", {
+                        type: "text",
+                        class: "kcu-input kcu-input-ports",
+                        "data-test": "kcu-settings-cdp-ports",
+                        value: draft.cdpPortsText,
+                        placeholder: "9222, 9229",
+                        onInput: onCdpPortsInput,
+                      }),
+                      h(
+                        ActionButton,
+                        {
+                          variant: "secondary",
+                          size: "sm",
+                          "data-test": "kcu-settings-save-cdp",
+                          disabled: store.state.savingPolicy || !cdpCheck.value.valid,
+                          onClick: () => void saveCdpPorts(),
+                        },
+                        { default: () => t("settings.applyCdpPorts") },
+                      ),
+                    ]),
                 },
               ),
             ],

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Literal, NotRequired, TypedDict
 
 Mode = Literal['locked', 'read_only', 'confirm', 'armed']
+Reasoning = Literal['inherit', 'minimal', 'low', 'medium', 'high']
+RootKind = Literal['window', 'dialog', 'menu', 'popover', 'cdp']
 Outcome = Literal['worked', 'didnt', 'unknown', 'blocked', 'info']
 Event = Literal['observe', 'act', 'blocked', 'mode_change', 'panic', 'panic_reset']
 ActionName = Literal[
@@ -34,7 +36,8 @@ class RootItem(TypedDict):
     exe_name: str
     title: str
     class_name: str
-    kind: Literal['window', 'dialog', 'menu', 'popover']
+    kind: RootKind
+    url: NotRequired[str]
     rect: Rect
     dpi_scale: float
     is_foreground: bool
@@ -45,6 +48,8 @@ class RootItem(TypedDict):
 
 class WorkerRoot(RootItem):
     exe_path: str
+    ws_url: NotRequired[str]
+    document_id: NotRequired[str]
 
 
 class ElementItem(TypedDict):
@@ -86,6 +91,8 @@ class StateSummary(TypedDict):
     pid: int
     exe_name: str
     title: str
+    kind: NotRequired[RootKind]
+    url: NotRequired[str]
     dpi_scale: float
     rect: Rect
     element_count: int
@@ -115,7 +122,14 @@ class Stats(TypedDict):
     blocked: int
 
 
-class StatusPayload(TypedDict):
+class DesktopSettings(TypedDict):
+    desktop_model: str
+    desktop_reasoning_effort: Reasoning
+    cdp_ports: list[int]
+
+
+class StatusPayload(DesktopSettings):
+    policy: DesktopSettings
     supported: bool
     platform: str
     mode: Mode
@@ -182,6 +196,7 @@ class ActionReport(TypedDict):
 class ActPayload(TypedDict):
     results: list[ActionReport]
     post_state: StateDetail | None
+    before_state: NotRequired[StateDetail]
 
 
 class WorkerRequest(TypedDict):
@@ -238,6 +253,9 @@ class Policy:
     hotkey: str
     denylist_patterns: tuple[str, ...]
     allowlist_patterns: tuple[str, ...]
+    desktop_model: str
+    desktop_reasoning_effort: Reasoning
+    cdp_ports: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,7 +297,7 @@ DEFAULT_DENYLIST = (
     '1Password', 'Bitwarden', 'KeePass', 'CredentialUIBroker',
     'User Account Control', 'Windows Security', 'Taskmgr',
 )
-DEFAULT_POLICY = Policy('locked', True, 0, 'Ctrl+Alt+F12', DEFAULT_DENYLIST, ())
+DEFAULT_POLICY = Policy('locked', True, 0, 'Ctrl+Alt+F12', DEFAULT_DENYLIST, (), '', 'low', (9222, 9229))
 DESTRUCTIVE = re.compile(
     r'\b(delete|remove|erase|discard|wipe|destroy|uninstall|format|reset|terminate|shut down|'
     r'restart|sign out|log off|close|empty recycle bin)\b|删除|刪除|卸载|解除安裝|清除|清空|關閉|关闭|关机|關機|重置',
@@ -297,7 +315,8 @@ KEYS = {
 
 
 def parse_chord(chord: str, hotkey: bool) -> tuple[int, tuple[int, ...], int]:
-    parts = [part.strip().upper() for part in chord.split('+')]
+    aliases = {'CONTROL': 'CTRL', 'META': 'WIN'}
+    parts = [aliases.get(key, key) for key in (part.strip().upper() for part in chord.split('+'))]
     mods, key = parts[:-1], parts[-1]
     if len(mods) != len(set(mods)) or any(mod not in MODIFIERS for mod in mods) or key not in KEYS:
         raise ValueError('Invalid key chord')
@@ -307,7 +326,7 @@ def parse_chord(chord: str, hotkey: bool) -> tuple[int, tuple[int, ...], int]:
 
 
 def destructive_control(role: str, name: str) -> bool:
-    return role in ('Button', 'MenuItem', 'SplitButton', 'Hyperlink') and bool(DESTRUCTIVE.search(name))
+    return role.casefold() in ('button', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'splitbutton', 'hyperlink') and bool(DESTRUCTIVE.search(name))
 
 
 def risky_chord(chord: str) -> bool:
@@ -321,7 +340,7 @@ def identity(root: WorkerRoot) -> Identity:
 
 def matches_patterns(root: WorkerRoot, patterns: tuple[str, ...] | list[str]) -> bool:
     return any(
-        re.search(pattern, root[key], re.IGNORECASE)
+        re.search(pattern, root.get(key, ''), re.IGNORECASE)
         for pattern in patterns
-        for key in ('title', 'exe_name', 'exe_path', 'class_name')
+        for key in ('title', 'exe_name', 'exe_path', 'class_name', 'url')
     )

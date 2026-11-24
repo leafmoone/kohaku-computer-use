@@ -112,6 +112,21 @@ class Native:
         self.metrics = bind(u, 'GetSystemMetrics', I, I)
         self.send_input = bind(u, 'SendInput', UINT, UINT, P(Input), I)
         self.map_key = bind(u, 'MapVirtualKeyW', UINT, UINT, UINT)
+        self.create_window = bind(u, 'CreateWindowExW', HWND, D, w.LPCWSTR, w.LPCWSTR, D,
+                                  I, I, I, I, HWND, H, H, c.c_void_p)
+        self.destroy_window = bind(u, 'DestroyWindow', B, HWND)
+        self.open_clipboard = bind(u, 'OpenClipboard', B, HWND)
+        self.close_clipboard = bind(u, 'CloseClipboard', B)
+        self.empty_clipboard = bind(u, 'EmptyClipboard', B)
+        self.has_clipboard = bind(u, 'IsClipboardFormatAvailable', B, UINT)
+        self.get_clipboard = bind(u, 'GetClipboardData', H, UINT)
+        self.set_clipboard = bind(u, 'SetClipboardData', H, UINT, H)
+        self.clipboard_owner = bind(u, 'GetClipboardOwner', HWND)
+        self.global_alloc = bind(k, 'GlobalAlloc', H, UINT, c.c_size_t)
+        self.global_lock = bind(k, 'GlobalLock', c.c_void_p, H)
+        self.global_unlock = bind(k, 'GlobalUnlock', B, H)
+        self.global_free = bind(k, 'GlobalFree', H, H)
+        self.clipboard_window = None
         self.open_process = bind(k, 'OpenProcess', H, D, B, D)
         self.current_process = bind(k, 'GetCurrentProcess', H)
         self.close = bind(k, 'CloseHandle', B, H)
@@ -327,11 +342,98 @@ class Native:
         events = []
         for key, release in [(item, False) for item in keys] + [(item, True) for item in reversed(keys)]:
             scan = self.map_key(key, 4)
-            flags = (2 if release else 0) | (8 if scan else 0) | (1 if scan >> 8 == 0xE0 else 0)
+            # Some Windows layouts return the keypad scan code for navigation keys.
+            extended = scan >> 8 == 0xE0 or key in (0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x5B)
+            flags = (2 if release else 0) | (8 if scan else 0) | int(extended)
             events.append(Input(kind=1, keyboard=KeyboardInput(0 if scan else key, scan & 0xFF, flags, 0, 0)))
         self.inject(events)
 
-    def text(self, text):
+    def clipboard_open(self):
+        if self.clipboard_window is None:
+            # EmptyClipboard needs a real owner before SetClipboardData can succeed.
+            self.clipboard_window = self.create_window(0, 'Static', None, 0, 0, 0, 0, 0, HWND(-3), None, None, None)
+            if not self.clipboard_window:
+                raise c.WinError(c.get_last_error())
+        for attempt in range(5):
+            if self.open_clipboard(self.clipboard_window):
+                return True
+            if attempt < 4:
+                time.sleep(0.01)
+        return False
+
+    def clipboard_text(self):
+        if not self.has_clipboard(13):
+            return None
+        handle = self.get_clipboard(13)
+        if not handle or not (pointer := self.global_lock(handle)):
+            raise c.WinError(c.get_last_error())
+        try:
+            return c.wstring_at(pointer)
+        finally:
+            self.global_unlock(handle)
+
+    def replace_clipboard(self, text):
+        handle = None
+        if text is not None:
+            data = text.encode('utf-16-le') + b'\0\0'
+            handle = self.global_alloc(2, len(data))
+            if not handle:
+                raise c.WinError(c.get_last_error())
+        try:
+            if handle:
+                if not (pointer := self.global_lock(handle)):
+                    raise c.WinError(c.get_last_error())
+                try:
+                    c.memmove(pointer, data, len(data))
+                finally:
+                    self.global_unlock(handle)
+            if not self.empty_clipboard() or (handle and not self.set_clipboard(13, handle)):
+                raise c.WinError(c.get_last_error())
+            handle = None  # Clipboard owns the handle after transfer.
+        finally:
+            if handle:
+                self.global_free(handle)
+
+    def release_clipboard_window(self):
+        if self.clipboard_window and not self.destroy_window(self.clipboard_window):
+            raise c.WinError(c.get_last_error())
+        self.clipboard_window = None
+
+    def paste_text(self, text, verify):
+        try:
+            if not self.clipboard_open():
+                return False
+            try:
+                previous = self.clipboard_text()
+                try:
+                    self.replace_clipboard(text.replace('\r\n', '\n').replace('\n', '\r\n'))
+                except OSError:
+                    if self.clipboard_owner() == self.clipboard_window:
+                        self.replace_clipboard(previous)
+                    raise
+            finally:
+                self.close_clipboard()
+            try:
+                verify()
+                self.chord('Ctrl+V')
+                time.sleep(0.04)
+            finally:
+                if not self.clipboard_open():
+                    raise WorkerError('clipboard_restore_busy')
+                try:
+                    if self.clipboard_owner() == self.clipboard_window:
+                        self.replace_clipboard(previous)
+                finally:
+                    self.close_clipboard()
+            return True
+        finally:
+            # Do not leave clipboard ownership with an idle UIA thread.
+            self.release_clipboard_window()
+
+    def text(self, text, verify):
+        if (len(text) >= 2 or '\n' in text or not text.isascii()) and '\0' not in text and self.paste_text(text, verify):
+            return
+        verify()
         data = text.encode('utf-16-le')
         self.inject([
             Input(kind=1, keyboard=KeyboardInput(0, data[i] | data[i + 1] << 8, flag, 0, 0))
@@ -670,7 +772,7 @@ class Automation:
                 self.verify_focus(request, root, action, point, target)
                 self.native.chord('Backspace')
                 self.verify_focus(request, root, action, point, target)
-            self.native.text(action['text'])
+            self.native.text(action['text'], lambda: self.verify_focus(request, root, action, point, target))
         elif name in ('expand', 'collapse', 'key'):
             self.native.chord(action.get('key') or ('Right' if name == 'expand' else 'Left'))
         else:

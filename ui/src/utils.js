@@ -1,4 +1,6 @@
 export const MODES = Object.freeze(["locked", "read_only", "confirm", "armed"])
+export const DESKTOP_EFFORTS = Object.freeze(["low", "minimal", "medium", "high", "inherit"])
+export const DEFAULT_CDP_PORTS = Object.freeze([9222, 9229])
 
 export const DEFAULT_DENYLIST_PATTERNS = Object.freeze([
   "1Password",
@@ -128,6 +130,98 @@ export function splitPatternLines(text) {
 export function joinPatternLines(patterns) {
   if (!Array.isArray(patterns)) return ""
   return patterns.map((p) => String(p)).join("\n")
+}
+
+export function normalizeDesktopEffort(rawEffort) {
+  const val = String(rawEffort || "").trim().toLowerCase()
+  return DESKTOP_EFFORTS.includes(val) ? val : "low"
+}
+
+export function parsePortsText(raw) {
+  const tokens = String(raw || "")
+    .split(/[\s,;]+/)
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0)
+  const seen = new Set()
+  const out = []
+  for (const token of tokens) {
+    if (!/^\d+$/.test(token)) continue
+    const port = Number(token)
+    if (!Number.isSafeInteger(port) || port < 1024 || port > 65535) continue
+    if (seen.has(port)) continue
+    seen.add(port)
+    out.push(port)
+    if (out.length >= 8) break
+  }
+  return out
+}
+
+export function validatePortsText(raw) {
+  const tokens = String(raw || "")
+    .split(/[\s,;]+/)
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0)
+  const seen = new Set()
+  const ports = []
+  const invalidTokens = []
+  for (const token of tokens) {
+    if (!/^\d+$/.test(token)) {
+      invalidTokens.push(token)
+      continue
+    }
+    const port = Number(token)
+    if (!Number.isSafeInteger(port) || port < 1024 || port > 65535) {
+      invalidTokens.push(token)
+      continue
+    }
+    if (!seen.has(port)) {
+      seen.add(port)
+      ports.push(port)
+    }
+  }
+  const tooMany = ports.length > 8
+  return {
+    valid: invalidTokens.length === 0 && !tooMany,
+    ports: ports.slice(0, 8),
+    invalidTokens,
+    tooMany,
+  }
+}
+
+export function formatPortsList(ports) {
+  if (!Array.isArray(ports) || ports.length === 0) return ""
+  return ports
+    .map((p) => Number(p))
+    .filter((p) => Number.isSafeInteger(p) && p >= 1024 && p <= 65535)
+    .slice(0, 8)
+    .join(", ")
+}
+
+export function readStatusField(status, key, fallback) {
+  if (!status || typeof status !== "object") return fallback
+  if (status[key] !== undefined) return status[key]
+  if (status.policy && typeof status.policy === "object" && status.policy[key] !== undefined) {
+    return status.policy[key]
+  }
+  return fallback
+}
+
+export function groupModelsByProvider(models) {
+  if (!Array.isArray(models)) return []
+  const groupsMap = new Map()
+  for (const item of models) {
+    if (!item || typeof item !== "object" || !item.selector) continue
+    const provider = String(item.provider || "other")
+    if (!groupsMap.has(provider)) {
+      groupsMap.set(provider, [])
+    }
+    groupsMap.get(provider).push(item)
+  }
+  const out = []
+  for (const [provider, items] of groupsMap.entries()) {
+    out.push({ provider, items })
+  }
+  return out
 }
 
 export function validateRegexPatterns(patterns) {

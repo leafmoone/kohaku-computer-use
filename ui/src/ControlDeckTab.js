@@ -19,11 +19,16 @@ function formatRootOptionLabel(root, t) {
   const dpiPct = Math.round((Number(root.dpi_scale) || 1) * 100)
   const titleText = root.title ? String(root.title) : "(untitled)"
   const tags = []
+  if (root.kind === "cdp") tags.push(`[${t("deck.tagCdp")}]`)
   if (root.is_foreground) tags.push(`[${t("deck.tagForeground")}]`)
   if (root.is_minimized) tags.push(`[${t("deck.tagMinimized")}]`)
   if (root.is_elevated) tags.push(`[${t("deck.tagElevated")}]`)
   if (root.denylisted) tags.push(`[${t("deck.tagDenylisted")}]`)
   const tagSuffix = tags.length > 0 ? ` ${tags.join(" ")}` : ""
+  if (root.kind === "cdp") {
+    const cdpMeta = root.url ? String(root.url) : root.exe_name || "browser"
+    return `${root.root_ref} · [CDP] ${titleText} · ${cdpMeta}${tagSuffix}`
+  }
   return `${root.root_ref} · ${root.exe_name} · ${titleText} · ${dpiPct}%${tagSuffix}`
 }
 
@@ -153,6 +158,10 @@ export default defineComponent({
       const workerAlive = Boolean(status && status.worker_alive)
       const hotkeyText = status && status.hotkey ? status.hotkey : "Ctrl+Alt+F12"
       const lease = status && status.active_lease ? status.active_lease : null
+      const desktopModelName = store.state.desktopModel
+        ? store.state.desktopModel
+        : t("settings.desktopModelInherit")
+      const desktopEffortName = t(`effort.${store.state.desktopReasoningEffort || "low"}`)
 
       return h(
         "section",
@@ -195,6 +204,17 @@ export default defineComponent({
                       ? t("deck.hotkeyStandby")
                       : t("popover.hotkeyUnavailable")
                 }`,
+              ),
+              h(
+                "span",
+                {
+                  class: "kcu-kpi",
+                  "data-test": "kcu-deck-desktop-model-badge",
+                },
+                t("deck.desktopModelBadge", {
+                  model: desktopModelName,
+                  effort: desktopEffortName,
+                }),
               ),
               lease
                 ? h(
@@ -436,6 +456,51 @@ export default defineComponent({
           selectedRoot.value && selectedRoot.value.denylisted
             ? h("div", { class: "kcu-banner kcu-banner-warn" }, t("deck.denylistedNotice"))
             : null,
+          store.state.roots.length > 0
+            ? h(
+                "div",
+                { class: "kcu-roots-list", "data-test": "kcu-deck-roots-list" },
+                store.state.roots.map((root) => {
+                  const isActive = selectedRootRef.value === root.root_ref
+                  const isCdp = root.kind === "cdp"
+                  return h(
+                    "button",
+                    {
+                      key: root.root_ref,
+                      type: "button",
+                      class: isActive ? "kcu-root-chip is-active" : "kcu-root-chip",
+                      "data-test": `kcu-root-item-${root.root_ref}`,
+                      onClick: () => {
+                        selectedRootRef.value = root.root_ref
+                      },
+                    },
+                    [
+                      h("span", { class: "kcu-root-chip-head" }, [
+                        h("span", { class: "kcu-mono-chip" }, root.root_ref),
+                        isCdp
+                          ? h(
+                              "span",
+                              {
+                                class: "kcu-badge kcu-badge-cdp",
+                                "data-test": "kcu-root-cdp-badge",
+                              },
+                              t("deck.tagCdp"),
+                            )
+                          : null,
+                        h("span", { class: "kcu-root-chip-title" }, root.title || root.exe_name || "(untitled)"),
+                      ].filter(Boolean)),
+                      isCdp && root.url
+                        ? h("span", { class: "kcu-root-chip-sub", "data-test": "kcu-root-url" }, root.url)
+                        : h(
+                            "span",
+                            { class: "kcu-root-chip-sub" },
+                            `${root.exe_name || "window"} · ${Math.round((Number(root.dpi_scale) || 1) * 100)}%`,
+                          ),
+                    ],
+                  )
+                }),
+              )
+            : null,
         ],
       )
     }
@@ -467,7 +532,11 @@ export default defineComponent({
           ]),
           detail
             ? h("div", { class: "kcu-state-subtitle" }, [
-                h("span", { class: "kcu-state-title-text" }, `${detail.exe_name} — ${detail.title || "(untitled)"}`),
+                h(
+                  "span",
+                  { class: "kcu-state-title-text" },
+                  `${detail.exe_name || "browser"} — ${detail.title || "(untitled)"}${detail.url ? ` · ${detail.url}` : ""}`,
+                ),
                 h(
                   "span",
                   { class: "kcu-state-meta-text" },

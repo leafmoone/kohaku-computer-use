@@ -17,10 +17,11 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, get_args
 from uuid import uuid4
 from weakref import ReferenceType, ref
 
+from . import cdp
 from .models import (
     DEFAULT_POLICY,
     Action,
@@ -33,6 +34,7 @@ from .models import (
     Event,
     Lease,
     Outcome,
+    Reasoning,
     RootItem,
     Snapshot,
     StateDetail,
@@ -88,7 +90,7 @@ def action_key(actions: list[Action]) -> str:
 
 
 def public_root(root: WorkerRoot) -> RootItem:
-    return {key: deepcopy(value) for key, value in root.items() if key != 'exe_path'}
+    return {key: deepcopy(value) for key, value in root.items() if key not in ('exe_path', 'ws_url', 'document_id')}
 
 
 def window_rank(root: WorkerRoot) -> tuple[bool, bool, bool, int]:
@@ -191,6 +193,7 @@ class DesktopBroker:
         self.audit: deque[AuditEntry] = deque(maxlen=30)
         self.stats = {'observations': 0, 'actions': 0, 'blocked': 0}
         self.roots: dict[str, WorkerRoot] = {}
+        self.studio_origins = cdp.studio_origins()
         self.next_root = 0
         self.lock = threading.RLock()
         self.calls = threading.Lock()
@@ -338,7 +341,9 @@ class DesktopBroker:
             self.pending = (self.serial, replies)
             worker.outgoing.put(request)
         try:
-            reply = replies.get(timeout=CALL_TIMEOUT)
+            waits = sum(action.get('wait_ms', 0) + (action['expect'].get('timeout_ms', 1500)
+                        if 'expect' in action else 0) for action in request.get('actions', ()))
+            reply = replies.get(timeout=CALL_TIMEOUT + waits / 1000)
         except queue.Empty as exc:
             with self.lock:
                 if self.worker is worker:
@@ -386,7 +391,9 @@ class DesktopBroker:
             payload = asdict(self.policy)
             payload['denylist_patterns'] = list(self.policy.denylist_patterns)
             payload['allowlist_patterns'] = list(self.policy.allowlist_patterns)
-            return {**payload, 'supported': self.supported, 'platform': sys.platform, 'tripped': self.tripped,
+            payload['cdp_ports'] = list(self.policy.cdp_ports)
+            settings = {key: payload[key] for key in ('desktop_model', 'desktop_reasoning_effort', 'cdp_ports')}
+            return {**payload, 'policy': settings, 'supported': self.supported, 'platform': sys.platform, 'tripped': self.tripped,
                     'trip_reason': self.trip_reason, 'hotkey_registered': self.hotkey_registered,
                     'idle_remaining_s': max(0., self.deadline - time.monotonic()) if self.deadline is not None else None,
                     'active_lease': {**asdict(lease.actor), 'updated_at': lease.updated_at,
@@ -405,6 +412,21 @@ class DesktopBroker:
                 raise BrokerError(501, 'unsupported_platform', 'blocked')
             if mode not in ('locked', 'read_only', 'confirm', 'armed'):
                 raise BrokerError(422, 'invalid_mode', 'blocked')
+            changes = dict(changes)
+            if 'desktop_model' in changes:
+                model = changes['desktop_model']
+                if not isinstance(model, str) or len(model.strip()) > 200:
+                    raise BrokerError(422, 'invalid_desktop_model', 'blocked')
+                changes['desktop_model'] = model.strip()
+            if changes.get('desktop_reasoning_effort', 'low') not in get_args(Reasoning):
+                raise BrokerError(422, 'invalid_desktop_reasoning_effort', 'blocked')
+            if 'cdp_ports' in changes:
+                ports = changes['cdp_ports']
+                if not isinstance(ports, (list, tuple)) or any(type(port) is not int or not 1024 <= port <= 65535 for port in ports):
+                    raise BrokerError(422, 'invalid_cdp_ports', 'blocked')
+                changes['cdp_ports'] = tuple(dict.fromkeys(ports))
+                if len(changes['cdp_ports']) > 8:
+                    raise BrokerError(422, 'too_many_cdp_ports', 'blocked')
             try:
                 if 'hotkey' in changes:
                     parse_chord(changes['hotkey'], True)
@@ -511,7 +533,15 @@ class DesktopBroker:
             if mutate and not self.hotkey_registered:
                 raise BrokerError(409, 'hotkey_unavailable', 'blocked')
 
+    def remember_studio(self, server: tuple | None):
+        if server and isinstance(server[1], int):
+            with self.lock:
+                self.studio_origins.update((scheme, host, server[1]) for scheme in ('http', 'https')
+                                           for host in ('loopback', server[0]))
+
     def _check_root(self, root: WorkerRoot):
+        if root.get('kind') == 'cdp' and cdp.blocked(root['url'], self.studio_origins):
+            raise BrokerError(403, 'studio_target', 'blocked')
         if matches_patterns(root, self.policy.denylist_patterns):
             raise BrokerError(403, 'denylisted_target', 'blocked')
         if not root['exe_path']:
@@ -529,7 +559,14 @@ class DesktopBroker:
         return snapshot
 
     def _fresh(self, root: WorkerRoot, guard: Callable[[], None]) -> WorkerRoot:
-        current = self._rpc({'id': 0, 'op': 'identify', 'root_ref': root['root_ref'], 'hwnd': root['hwnd']}, guard)
+        if root.get('kind') == 'cdp':
+            pages, _ = self._discover(guard)
+            current = next((page for page in pages if page['exe_path'] == root['exe_path'] and page['ws_url'] == root['ws_url']), None)
+            if current is None or current['url'] != root['url']:
+                raise BrokerError(409, 'cdp_page_changed', 'blocked')
+            current = {**root, 'title': current['title']}
+        else:
+            current = self._rpc({'id': 0, 'op': 'identify', 'root_ref': root['root_ref'], 'hwnd': root['hwnd']}, guard)
         with self.lock:
             guard()
             self._check_root(current)
@@ -549,11 +586,22 @@ class DesktopBroker:
         self.roots = {root['root_ref']: root for root in result}
         return result
 
-    def _list(self, guard: Callable[[], None]) -> list[WorkerRoot]:
-        listed = self._rpc({'id': 0, 'op': 'list_roots'}, guard)
+    def _discover(self, guard: Callable[[], None]) -> tuple[list[WorkerRoot], list[int]]:
         with self.lock:
             guard()
-            return self._update_roots(listed)
+            self.studio_origins.update(cdp.studio_origins())
+            ports, blocked = self.policy.cdp_ports, self.studio_origins.copy()
+        return cdp.discover_cdp_pages(ports, blocked)
+
+    def _list(self, guard: Callable[[], None], include_cdp: bool) -> list[WorkerRoot]:
+        listed = self._rpc({'id': 0, 'op': 'list_roots'}, guard)
+        pages = self._discover(guard)[0] if include_cdp else []
+        with self.lock:
+            guard()
+            if not include_cdp:
+                pages = [root for root in self.roots.values() if root.get('kind') == 'cdp']
+            updated = self._update_roots(listed + pages)
+            return updated if include_cdp else updated[:len(listed)]
 
     def list_roots(self, context: ToolContext | None) -> list[RootItem]:
         def guard():
@@ -566,7 +614,7 @@ class DesktopBroker:
                 self._gate(context, False)
                 generation = self.generation
             try:
-                listed = self._list(guard)
+                listed = self._list(guard, True)
                 with self.lock:
                     guard()
                     if context is not None:
@@ -587,7 +635,7 @@ class DesktopBroker:
             else:
                 root = None
         if root is None:
-            roots = self._list(guard)
+            roots = self._list(guard, False)
             if hwnd is None and query is not None:
                 needle = query.casefold()
                 root = max((item for item in roots if not item['denylisted'] and item['exe_path']
@@ -599,10 +647,94 @@ class DesktopBroker:
                 root = next((item for item in roots if item['hwnd'] == hwnd or (hwnd is None and item['is_foreground'])), None)
                 if root is None:
                     raise BrokerError(404, 'no_matching_root', 'blocked')
+        elif root.get('kind') == 'cdp':
+            pages, _ = self._discover(guard)
+            page = next((item for item in pages if item['ws_url'] == root['ws_url']), None)
+            if page is None:
+                raise BrokerError(409, 'cdp_page_unavailable', 'blocked')
+            root = {**page, 'root_ref': root['root_ref']}
         with self.lock:
             guard()
             self._check_root(root)
         return root
+
+    def _check_url(self, url: str):
+        if cdp.origin(url) is None or any(ord(char) <= 32 or char == '\\' for char in url):
+            raise BrokerError(422, 'cdp_requires_http_url', 'blocked')
+        self.studio_origins.update(cdp.studio_origins())
+        if cdp.blocked(url, self.studio_origins):
+            raise BrokerError(403, 'studio_target', 'blocked')
+        if any(re.search(pattern, url, re.IGNORECASE) for pattern in self.policy.denylist_patterns):
+            raise BrokerError(403, 'denylisted_target', 'blocked')
+
+    def _check_open_page(self, context: ToolContext, url: str):
+        self._gate(context, True)
+        self._check_url(url)
+        if not self.policy.allow_foreground_input:
+            raise BrokerError(403, 'foreground_input_disabled', 'blocked')
+
+    def preview_url(self, context: ToolContext, url: str) -> tuple[bool, int]:
+        with self.calls:
+            with self.lock:
+                self._gate(context, False)
+                self._check_url(url)
+                generation = self.generation
+
+            def guard():
+                self._gate(context, False)
+                if generation != self.generation:
+                    raise BrokerError(409, 'desktop_policy_or_lease_changed', 'blocked')
+
+            pages, _ = self._discover(guard)
+            with self.lock:
+                guard()
+                if cdp.matching_page(pages, url):
+                    return False, generation
+                self._check_open_page(context, url)
+                return self.policy.mode == 'confirm', generation
+
+    def approve_url(self, context: ToolContext, url: str, generation: int) -> str:
+        with self.lock:
+            self._check_open_page(context, url)
+            if generation != self.generation:
+                raise BrokerError(409, 'approval_context_changed', 'blocked')
+            token = uuid4().hex
+            now = time.monotonic()
+            self.approvals = {key: existing for key, existing in self.approvals.items() if existing.deadline >= now}
+            self.approvals[token] = Approval(actor_for(context), '', self.epoch, url, '', now + 15)
+            return token
+
+    def _url_target(self, context: ToolContext, url: str, token: str | None, guard: Callable[[], None]) -> WorkerRoot:
+        with self.lock:
+            guard()
+            self._check_url(url)
+            approval = self.approvals.pop(token, None) if token else None
+        pages, listening = self._discover(guard)
+        root = cdp.matching_page(pages, url)
+        if root is None:
+            def open_guard():
+                with self.lock:
+                    guard()
+                    self._check_open_page(context, url)
+                    if self.policy.mode == 'confirm' and not (approval and approval.actor == actor_for(context)
+                            and not approval.state_id and approval.actions == url and approval.epoch == self.epoch
+                            and approval.deadline >= time.monotonic()):
+                        raise BrokerError(403, 'one_time_approval_required', 'blocked')
+
+            with self.lock:
+                open_guard()
+                ports, blocked = self.policy.cdp_ports, self.studio_origins.copy()
+            try:
+                root = cdp.open_page(url, ports, listening, blocked, open_guard)
+            except cdp.CDPError as exc:
+                raise BrokerError(409, str(exc), 'blocked') from exc
+            pages.append(root)
+        with self.lock:
+            guard()
+            updated = self._update_roots([item for item in self.roots.values() if item.get('kind') != 'cdp'] + pages)
+            root = next(item for item in updated if item['exe_path'] == root['exe_path'] and item['kind'] == 'cdp')
+            self._check_root(root)
+            return root
 
     def precheck(self, context: ToolContext, tool: str, args: dict):
         actor_for(context)
@@ -673,7 +805,7 @@ class DesktopBroker:
         self._check_root(root)
         self.epoch += 1
         png = base64.b64decode(worker['png'], validate=True) if worker['png'] else None
-        detail = {key: root[key] for key in ('root_ref', 'hwnd', 'pid', 'exe_name', 'title', 'dpi_scale', 'rect')}
+        detail = {key: root[key] for key in ('root_ref', 'hwnd', 'pid', 'exe_name', 'title', 'dpi_scale', 'rect', 'kind', 'url') if key in root}
         detail.update({'state_id': uuid4().hex, 'epoch': self.epoch, 'created_at': time.time(), 'valid_for_act': False,
                        'element_count': len(worker['elements']), 'has_image': bool(png), 'image_width': worker['image_width'],
                        'image_height': worker['image_height'], 'capture_method': worker['capture_method'],
@@ -694,6 +826,19 @@ class DesktopBroker:
 
     def _capture(self, root: WorkerRoot, include_image: bool, max_elements: int, restore: bool,
                  guard: Callable[[], None]) -> WorkerSnapshot:
+        if root.get('kind') == 'cdp':
+            def cdp_guard():
+                with self.lock:
+                    guard()
+
+            def check(page):
+                with self.lock:
+                    self._check_root(page)
+
+            try:
+                return cdp.observe_cdp(root, include_image, max_elements, cdp_guard, check)
+            except cdp.CDPError as exc:
+                raise BrokerError(409, str(exc), 'blocked') from exc
         with self.lock:
             guard()
             request = {'id': 0, 'op': 'observe', 'identity': identity(root), 'root_ref': root['root_ref'],
@@ -703,6 +848,15 @@ class DesktopBroker:
 
     def observe(self, context: ToolContext | None, root_ref: str | None, hwnd: int | None,
                 include_image: bool, max_elements: int, query: str | None, restore: bool) -> tuple[StateDetail, bytes | None]:
+        return self._observe(context, root_ref, hwnd, include_image, max_elements, query, restore, None, None)
+
+    def observe_url(self, context: ToolContext, url: str, include_image: bool, max_elements: int,
+                    token: str | None) -> tuple[StateDetail, bytes | None]:
+        return self._observe(context, None, None, include_image, max_elements, None, False, url, token)
+
+    def _observe(self, context: ToolContext | None, root_ref: str | None, hwnd: int | None, include_image: bool,
+                 max_elements: int, query: str | None, restore: bool, url: str | None,
+                 token: str | None) -> tuple[StateDetail, bytes | None]:
         actor = actor_for(context) if context is not None else None
         label = actor.agent_name if actor else OPERATOR
         with self.calls:
@@ -717,7 +871,7 @@ class DesktopBroker:
                     raise BrokerError(409, 'desktop_policy_or_lease_changed', 'blocked')
 
             try:
-                root = self._target(root_ref, hwnd, query, guard)
+                root = self._url_target(context, url, token, guard) if url is not None else self._target(root_ref, hwnd, query, guard)
                 result = self._capture(root, include_image, max_elements, restore, guard)
                 with self.lock:
                     guard()
@@ -798,7 +952,37 @@ class DesktopBroker:
                                'denylist_patterns': list(self.policy.denylist_patterns),
                                'allowlist_patterns': list(self.policy.allowlist_patterns),
                                'approved_title': current['title'] if has_approval() else None}
-                results = self._rpc(request, dispatch_guard)
+                if current.get('kind') == 'cdp':
+                    approved, patterns = has_approval(), self.policy.allowlist_patterns
+
+                    def cdp_guard():
+                        with self.lock:
+                            try:
+                                guard()
+                            except BrokerError as exc:
+                                raise cdp.CDPError(str(exc)) from exc
+
+                    def check(page):
+                        with self.lock:
+                            try:
+                                guard()
+                                self._check_root(page)
+                            except BrokerError as exc:
+                                raise cdp.CDPError(str(exc)) from exc
+
+                    def authorize(targets):
+                        if any(not enabled for _, _, enabled in targets):
+                            raise cdp.CDPError('cdp_element_disabled')
+                        if not approved and not matches_patterns(current, patterns) and any(
+                                destructive_control(role, name) for role, name, _ in targets):
+                            raise cdp.CDPError('one_time_approval_required')
+
+                    try:
+                        results = cdp.act_cdp(current, snapshot.elements, actions, cdp_guard, check, authorize)
+                    except cdp.CDPError as exc:
+                        raise BrokerError(409, str(exc), 'unknown') from exc
+                else:
+                    results = self._rpc(request, dispatch_guard)
             except BrokerError as exc:
                 with self.lock:
                     if exc.outcome == 'unknown':
@@ -843,7 +1027,7 @@ class DesktopBroker:
             finally:
                 with self.lock:
                     self.inflight = None
-            return {'results': results, 'post_state': post}
+            return {'results': results, 'post_state': post, 'before_state': snapshot.state}
 
     def state_index(self) -> StateIndex:
         with self.lock:

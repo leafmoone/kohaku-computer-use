@@ -3,13 +3,15 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from kohakuterrarium.api._io_executor import run_in_io_executor
 from kohakuterrarium.api.deps import get_service
+from kohakuterrarium.llm.profiles.resolve import list_all as list_all_models
 from kohakuterrarium.terrarium.service.service import LocalTerrariumService
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .broker import BROKER, OPERATOR, BrokerError, DesktopBroker
-from .models import Mode, RootItem, StateDetail, StateIndex, StatusPayload
+from .models import Mode, Reasoning, RootItem, StateDetail, StateIndex, StatusPayload
 
 router = APIRouter()
 
@@ -23,6 +25,9 @@ Pattern = Annotated[str, Field(min_length=1, max_length=512)]
 
 class PolicyBody(OperatorBody):
     mode: Mode | None = None
+    desktop_model: str | None = None
+    desktop_reasoning_effort: Reasoning | None = None
+    cdp_ports: list[Annotated[int, Field(ge=1024, le=65535)]] | None = None
     allow_foreground_input: bool | None = None
     idle_timeout_s: Annotated[int, Field(ge=0, le=86400)] | None = None
     hotkey: Annotated[str, Field(min_length=1, max_length=60)] | None = None
@@ -46,10 +51,17 @@ class ObserveBody(OperatorBody):
     include_image: bool = False
     restore: bool = False
 
+    @model_validator(mode='after')
+    def require_target(self):
+        if self.root_ref is None and self.hwnd is None:
+            raise ValueError('A root_ref or hwnd is required')
+        return self
 
-def local_broker(service: Annotated[object, Depends(get_service)]) -> DesktopBroker:
+
+def local_broker(service: Annotated[object, Depends(get_service)], request: Request) -> DesktopBroker:
     if not isinstance(service, LocalTerrariumService):
         raise HTTPException(status_code=501, detail='A local Terrarium service is required')
+    BROKER.remember_studio(request.scope.get('server'))
     return BROKER
 
 
@@ -63,6 +75,16 @@ def http_error(exc: BrokerError) -> HTTPException:
 @router.get('/status')
 def status(broker: Desktop) -> StatusPayload:
     return broker.status()
+
+
+@router.get('/models')
+async def models(broker: Desktop) -> dict[str, list[dict]]:
+    available = await run_in_io_executor(list_all_models)
+    rows = [{**{key: row[key] for key in ('provider', 'name', 'model', 'reasoning_effort')},
+             'selector': f'{row["provider"]}/{row["name"]}',
+             'reasoning_options': list((row.get('variation_groups') or {}).get('reasoning', {}))}
+            for row in available if row.get('available')]
+    return {'models': sorted(rows, key=lambda row: (row['provider'].casefold(), row['name'].casefold()))}
 
 
 @router.post('/policy')
