@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kohaku-computer-use"
+version = "0.1.0"
+description = "State-scoped Windows UI Automation and guarded desktop control for KohakuTerrarium."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "comtypes>=1.4.8,<2; sys_platform == 'win32'",
+    "Pillow>=11; sys_platform == 'win32'",
+    "jsonschema>=4",
+]
+
+[tool.setuptools.packages.find]
+include = ["kohaku_computer_use*"]
+
+[tool.ruff]
+target-version = "py311"

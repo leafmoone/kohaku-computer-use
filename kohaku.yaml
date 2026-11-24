@@ -1,0 +1,45 @@
+name: kohaku-computer-use
+version: 0.1.0
+description: >-
+  State-scoped Windows UI Automation and guarded desktop control for KohakuTerrarium.
+python_dependencies:
+  - "comtypes>=1.4.8,<2; sys_platform == 'win32'"
+plugins:
+  - name: computer_use
+    module: kohaku_computer_use.plugin
+    class: ComputerUsePlugin
+ui:
+  sdk: ">=1.2,<2"
+  root: ui
+  entry: ui/index.js
+  styles:
+    - ui/style.css
+  i18n:
+    en: ui/i18n/en.json
+    zh-CN: ui/i18n/zh-CN.json
+    zh-TW: ui/i18n/zh-TW.json
+  api: kohaku_computer_use.routes:router
+  contributes:
+    - kind: settings
+      id: preferences
+      label: Computer Use
+      owner: package
+    - kind: overlay
+      id: hud
+      label: Computer Use HUD
+      owner: package
+      anchor: top-left
+      width: 1
+      height: 1
+      draggable: false
+      resizable: false
+      clickThrough: true
+      defaultVisible: true
+    - kind: tab
+      id: deck
+      label: Computer Use
+      owner: package
+    - kind: command
+      id: panic-lock
+      label: Emergency Lock Computer Use
+      shortcut: Ctrl+Alt+X

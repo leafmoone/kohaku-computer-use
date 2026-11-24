@@ -1,0 +1,559 @@
+import { reactive, watch } from "vue"
+import { notify, useLocale } from "@kohakuterrarium/ui-sdk"
+import { tForLocale } from "./i18n.js"
+import { extractApiError, isValidMode } from "./utils.js"
+
+const POLL_INTERVAL_MS = 3000
+const WORK_DEBOUNCE_MS = 250
+const MAX_STATE_HISTORY = 16
+const MAX_AUDIT_ENTRIES = 30
+
+let activeStore = null
+let activeKt = null
+
+function activeLocale() {
+  try {
+    return useLocale().value
+  } catch (_err) {
+    return "en"
+  }
+}
+
+export function createCuStore(kt) {
+  if (!kt || !kt.api) {
+    throw new Error("createCuStore(kt) requires a valid KohakuTerrarium extension handle with kt.api")
+  }
+
+  const state = reactive({
+    status: null,
+    roots: [],
+    states: [],
+    audit: [],
+    selectedStateId: null,
+    selectedState: null,
+    selectedElementRef: null,
+    hoveredElementRef: null,
+    popoverOpen: false,
+    deckOpenCount: 0,
+    loadingStatus: false,
+    loadingRoots: false,
+    loadingObserve: false,
+    loadingStates: false,
+    savingPolicy: false,
+    error: "",
+    lastSyncedAt: 0,
+    disposed: false,
+  })
+
+  let pollTimer = null
+  let workDebounceTimer = null
+  let pollInFlight = false
+  let statusRequestSeq = 0
+  const stopHandles = []
+
+  function shouldPoll() {
+    if (state.disposed) return false
+    if (state.popoverOpen || state.deckOpenCount > 0) return true
+    return Boolean(state.status && state.status.mode !== "locked")
+  }
+
+  function clearTimers() {
+    if (pollTimer !== null) {
+      clearInterval(pollTimer)
+      pollTimer = null
+    }
+    if (workDebounceTimer !== null) {
+      clearTimeout(workDebounceTimer)
+      workDebounceTimer = null
+    }
+  }
+
+  function reconcilePolling() {
+    if (shouldPoll()) {
+      if (pollTimer === null) {
+        pollTimer = setInterval(() => {
+          void pollTick()
+        }, POLL_INTERVAL_MS)
+      }
+      return
+    }
+    if (pollTimer !== null) {
+      clearInterval(pollTimer)
+      pollTimer = null
+    }
+  }
+
+  function applyStatus(payload) {
+    if (state.disposed || !payload || typeof payload !== "object") return
+    const previousLatestId = state.status ? state.status.latest_state_id : null
+    state.status = payload
+    state.lastSyncedAt = Date.now()
+    state.error = ""
+    reconcilePolling()
+    if (
+      (state.deckOpenCount > 0 || state.popoverOpen) &&
+      !state.loadingObserve &&
+      !state.loadingStates &&
+      payload.latest_state_id &&
+      payload.latest_state_id !== previousLatestId
+    ) {
+      void fetchStates({ silent: true })
+    }
+  }
+
+  function clearError() {
+    state.error = ""
+  }
+
+  async function fetchStatus(options) {
+    const opts = options && typeof options === "object" ? options : {}
+    if (state.disposed) return { ok: false, error: "Store disposed" }
+    const reqSeq = ++statusRequestSeq
+    state.loadingStatus = true
+    try {
+      const resp = await kt.api.get("/status")
+      if (state.disposed || reqSeq < statusRequestSeq) {
+        return { ok: true, data: resp.data }
+      }
+      applyStatus(resp.data)
+      return { ok: true, data: resp.data }
+    } catch (err) {
+      const msg = extractApiError(err, "GET /status")
+      if (!state.disposed) {
+        state.error = msg
+        if (!opts.silent) notify(msg, "error")
+      }
+      return { ok: false, error: msg }
+    } finally {
+      state.loadingStatus = false
+    }
+  }
+
+  async function setPolicy(patch) {
+    if (state.disposed) return { ok: false, error: "Store disposed" }
+    if (!patch || typeof patch !== "object") {
+      const msg = "POST /policy: policy patch object is required"
+      state.error = msg
+      notify(msg, "error")
+      return { ok: false, error: msg }
+    }
+    if (patch.mode !== undefined && !isValidMode(patch.mode)) {
+      const msg = `POST /policy: invalid mode "${String(patch.mode)}"`
+      state.error = msg
+      notify(msg, "error")
+      return { ok: false, error: msg }
+    }
+    state.savingPolicy = true
+    try {
+      const resp = await kt.api.post("/policy", patch)
+      applyStatus(resp.data)
+      if (patch.mode !== undefined) {
+        const loc = activeLocale()
+        const actualMode = resp.data && resp.data.mode ? resp.data.mode : "locked"
+        const isTripped = Boolean(resp.data && resp.data.tripped)
+        if (patch.mode === "locked" && actualMode === "locked") {
+          notify(tForLocale(loc, "toast.lockedNow"), "info")
+        } else if (actualMode === patch.mode && !isTripped) {
+          const modeText = tForLocale(loc, `mode.${actualMode}`)
+          notify(tForLocale(loc, "toast.modeUpdated", { mode: modeText }), "success")
+        } else {
+          const requestedText = tForLocale(loc, `mode.${patch.mode}`)
+          const actualKey = isTripped ? "mode.tripped" : `mode.${actualMode}`
+          const actualText = tForLocale(loc, actualKey)
+          const rejectMsg = tForLocale(loc, "toast.modeSwitchRejected", {
+            requested: requestedText,
+            actual: actualText,
+          })
+          state.error = rejectMsg
+          notify(rejectMsg, "warning")
+          return { ok: false, error: rejectMsg, data: resp.data }
+        }
+      }
+      return { ok: true, data: resp.data }
+    } catch (err) {
+      const msg = extractApiError(err, "POST /policy")
+      state.error = msg
+      notify(msg, "error")
+      return { ok: false, error: msg }
+    } finally {
+      state.savingPolicy = false
+    }
+  }
+
+  async function triggerPanic(reason) {
+    if (state.disposed) return { ok: false, error: "Store disposed" }
+    const safeReason = reason ? String(reason) : "ui_panic"
+    state.savingPolicy = true
+    try {
+      const resp = await kt.api.post("/panic", { reason: safeReason })
+      applyStatus(resp.data)
+      notify(tForLocale(activeLocale(), "toast.panicTriggered"), "warning")
+      if (state.deckOpenCount > 0 || state.popoverOpen) {
+        void fetchStates({ silent: true })
+      }
+      return { ok: true, data: resp.data }
+    } catch (err) {
+      const msg = extractApiError(err, "POST /panic")
+      state.error = msg
+      notify(msg, "error")
+      return { ok: false, error: msg }
+    } finally {
+      state.savingPolicy = false
+    }
+  }
+
+  async function resetPanic() {
+    if (state.disposed) return { ok: false, error: "Store disposed" }
+    state.savingPolicy = true
+    try {
+      const resp = await kt.api.post("/panic/reset", {})
+      applyStatus(resp.data)
+      notify(tForLocale(activeLocale(), "toast.panicReset"), "info")
+      if (state.deckOpenCount > 0 || state.popoverOpen) {
+        void fetchStates({ silent: true })
+      }
+      return { ok: true, data: resp.data }
+    } catch (err) {
+      const msg = extractApiError(err, "POST /panic/reset")
+      state.error = msg
+      notify(msg, "error")
+      return { ok: false, error: msg }
+    } finally {
+      state.savingPolicy = false
+    }
+  }
+
+  async function fetchRoots(options) {
+    const opts = options && typeof options === "object" ? options : {}
+    if (state.disposed) return { ok: false, error: "Store disposed" }
+    state.loadingRoots = true
+    try {
+      const resp = await kt.api.get("/roots")
+      if (state.disposed) return { ok: true, data: resp.data }
+      const list = Array.isArray(resp.data && resp.data.roots) ? resp.data.roots : []
+      state.roots = list
+      state.error = ""
+      return { ok: true, data: list }
+    } catch (err) {
+      const msg = extractApiError(err, "GET /roots")
+      if (!state.disposed) {
+        state.error = msg
+        if (!opts.silent) notify(msg, "error")
+      }
+      return { ok: false, error: msg }
+    } finally {
+      state.loadingRoots = false
+    }
+  }
+
+  async function selectState(stateId, options) {
+    const opts = options && typeof options === "object" ? options : {}
+    if (state.disposed) return { ok: false, error: "Store disposed" }
+    if (!stateId) {
+      state.selectedStateId = null
+      state.selectedState = null
+      state.selectedElementRef = null
+      return { ok: true, data: null }
+    }
+    const targetId = String(stateId)
+    state.selectedStateId = targetId
+    try {
+      const resp = await kt.api.get(`/state/${encodeURIComponent(targetId)}`)
+      if (state.disposed || state.selectedStateId !== targetId) {
+        return { ok: true, data: resp.data }
+      }
+      state.selectedState = resp.data
+      if (state.selectedElementRef) {
+        const exists = Array.isArray(resp.data && resp.data.elements)
+          ? resp.data.elements.some((el) => el.ref === state.selectedElementRef)
+          : false
+        if (!exists) state.selectedElementRef = null
+      }
+      state.error = ""
+      return { ok: true, data: resp.data }
+    } catch (err) {
+      const msg = extractApiError(err, `GET /state/${targetId}`)
+      if (!state.disposed) {
+        state.error = msg
+        if (!opts.silent) notify(msg, "error")
+      }
+      return { ok: false, error: msg }
+    }
+  }
+
+  async function fetchStates(options) {
+    const opts = options && typeof options === "object" ? options : {}
+    if (state.disposed) return { ok: false, error: "Store disposed" }
+    state.loadingStates = true
+    try {
+      const resp = await kt.api.get("/states")
+      if (state.disposed) return { ok: true, data: resp.data }
+      const statesList = Array.isArray(resp.data && resp.data.states)
+        ? resp.data.states.slice(0, MAX_STATE_HISTORY)
+        : []
+      const auditList = Array.isArray(resp.data && resp.data.audit)
+        ? resp.data.audit.slice(0, MAX_AUDIT_ENTRIES)
+        : []
+      state.states = statesList
+      state.audit = auditList
+      state.error = ""
+
+      if (statesList.length === 0) {
+        state.selectedStateId = null
+        state.selectedState = null
+        state.selectedElementRef = null
+      } else {
+        const currentSummary = state.selectedStateId
+          ? statesList.find((item) => item.state_id === state.selectedStateId)
+          : null
+        const targetSummary = currentSummary || statesList[0]
+        const needsDetail =
+          !state.selectedState ||
+          state.selectedState.state_id !== targetSummary.state_id ||
+          state.selectedState.valid_for_act !== targetSummary.valid_for_act ||
+          state.selectedState.has_image !== targetSummary.has_image ||
+          JSON.stringify(state.selectedState.last_action_point || null) !==
+            JSON.stringify(targetSummary.last_action_point || null)
+        if (needsDetail) {
+          await selectState(targetSummary.state_id, { silent: opts.silent })
+        }
+      }
+      return { ok: true, data: resp.data }
+    } catch (err) {
+      const msg = extractApiError(err, "GET /states")
+      if (!state.disposed) {
+        state.error = msg
+        if (!opts.silent) notify(msg, "error")
+      }
+      return { ok: false, error: msg }
+    } finally {
+      state.loadingStates = false
+    }
+  }
+
+  async function observeTarget(rootRef, includeImage) {
+    if (state.disposed) return { ok: false, error: "Store disposed" }
+    const trimmedRef = rootRef ? String(rootRef) : null
+    const matchedRoot = trimmedRef
+      ? state.roots.find((item) => item && item.root_ref === trimmedRef)
+      : null
+    const payload = {
+      root_ref: trimmedRef,
+      hwnd: matchedRoot ? matchedRoot.hwnd : null,
+      include_image: Boolean(includeImage),
+    }
+    state.loadingObserve = true
+    try {
+      const resp = await kt.api.post("/observe", payload)
+      if (state.disposed) return { ok: true, data: resp.data }
+      state.selectedState = resp.data
+      state.selectedStateId = resp.data ? resp.data.state_id : null
+      state.selectedElementRef = null
+      state.error = ""
+      await Promise.all([fetchStatus({ silent: true }), fetchStates({ silent: true })])
+      return { ok: true, data: resp.data }
+    } catch (err) {
+      const msg = extractApiError(err, "POST /observe")
+      if (!state.disposed) {
+        state.error = msg
+        notify(msg, "error")
+      }
+      return { ok: false, error: msg }
+    } finally {
+      state.loadingObserve = false
+    }
+  }
+
+  async function pollTick() {
+    if (state.disposed || pollInFlight || !shouldPoll()) return
+    if (typeof document !== "undefined" && document.hidden) return
+    pollInFlight = true
+    try {
+      await fetchStatus({ silent: true })
+      if (!state.disposed && state.deckOpenCount > 0) {
+        await fetchStates({ silent: true })
+      }
+    } finally {
+      pollInFlight = false
+    }
+  }
+
+  function scheduleWorkRefresh() {
+    if (state.disposed) return
+    if (workDebounceTimer !== null) {
+      clearTimeout(workDebounceTimer)
+    }
+    workDebounceTimer = setTimeout(() => {
+      workDebounceTimer = null
+      if (state.disposed) return
+      void fetchStatus({ silent: true })
+      if (state.deckOpenCount > 0) {
+        void fetchStates({ silent: true })
+      }
+    }, WORK_DEBOUNCE_MS)
+  }
+
+  function bindWorkContext(workRef) {
+    if (!workRef) return () => {}
+    const stop = watch(
+      () => {
+        const val = workRef.value
+        if (!val) return "none|0|none|none"
+        return `${val.sessionId || ""}|${val.busy ? "1" : "0"}|${val.creatureId || ""}|${val.status || ""}`
+      },
+      (nextKey, prevKey) => {
+        if (state.disposed || !prevKey) return
+        const prevParts = String(prevKey).split("|")
+        const nextParts = String(nextKey).split("|")
+        const busyFinished = prevParts[1] === "1" && nextParts[1] === "0"
+        const targetChanged = prevParts[0] !== nextParts[0] || prevParts[2] !== nextParts[2]
+        if (busyFinished || targetChanged) {
+          scheduleWorkRefresh()
+        }
+      },
+    )
+    stopHandles.push(stop)
+    return () => {
+      stop()
+      const idx = stopHandles.indexOf(stop)
+      if (idx >= 0) stopHandles.splice(idx, 1)
+    }
+  }
+
+  function setPopoverOpen(open) {
+    const next = Boolean(open)
+    if (state.popoverOpen === next) return
+    state.popoverOpen = next
+    reconcilePolling()
+    if (next) {
+      void fetchStatus({ silent: true })
+      void fetchStates({ silent: true })
+    }
+  }
+
+  function togglePopover() {
+    setPopoverOpen(!state.popoverOpen)
+  }
+
+  function enterDeck() {
+    state.deckOpenCount += 1
+    reconcilePolling()
+    void fetchStatus({ silent: true })
+    void fetchRoots({ silent: true })
+    void fetchStates({ silent: true })
+  }
+
+  function leaveDeck() {
+    state.deckOpenCount = Math.max(0, state.deckOpenCount - 1)
+    reconcilePolling()
+  }
+
+  function setSelectedElement(ref) {
+    state.selectedElementRef = ref ? String(ref) : null
+  }
+
+  function setHoveredElement(ref) {
+    state.hoveredElementRef = ref ? String(ref) : null
+  }
+
+  function frameUrl(stateId, hostUrl) {
+    if (!stateId) return ""
+    const pkg = encodeURIComponent(kt.package || "kohaku-computer-use")
+    const base = hostUrl ? String(hostUrl).replace(/\/+$/, "") : ""
+    return `${base}/api/ext/${pkg}/frame/${encodeURIComponent(String(stateId))}`
+  }
+
+  function onFocusWake() {
+    if (state.disposed) return
+    void fetchStatus({ silent: true })
+    if (state.deckOpenCount > 0) {
+      void fetchStates({ silent: true })
+    }
+  }
+
+  function onVisibilityWake() {
+    if (state.disposed || (typeof document !== "undefined" && document.hidden)) return
+    onFocusWake()
+  }
+
+  if (typeof window !== "undefined") {
+    window.addEventListener("focus", onFocusWake)
+    stopHandles.push(() => window.removeEventListener("focus", onFocusWake))
+  }
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", onVisibilityWake)
+    stopHandles.push(() => document.removeEventListener("visibilitychange", onVisibilityWake))
+  }
+
+  function dispose() {
+    if (state.disposed) return
+    state.disposed = true
+    state.popoverOpen = false
+    state.deckOpenCount = 0
+    clearTimers()
+    while (stopHandles.length > 0) {
+      const stop = stopHandles.pop()
+      try {
+        stop()
+      } catch (_err) {
+        // Ignore cleanup errors during teardown.
+      }
+    }
+  }
+
+  void fetchStatus({ silent: true })
+
+  return {
+    kt,
+    state,
+    clearError,
+    fetchStatus,
+    setPolicy,
+    triggerPanic,
+    resetPanic,
+    fetchRoots,
+    observeTarget,
+    fetchStates,
+    selectState,
+    frameUrl,
+    bindWorkContext,
+    setPopoverOpen,
+    togglePopover,
+    enterDeck,
+    leaveDeck,
+    setSelectedElement,
+    setHoveredElement,
+    isPollingActive: () => pollTimer !== null,
+    dispose,
+  }
+}
+
+export function initCuStore(kt) {
+  if (activeStore && activeKt === kt && !activeStore.state.disposed) {
+    return activeStore
+  }
+  if (activeStore) {
+    activeStore.dispose()
+  }
+  activeKt = kt
+  activeStore = createCuStore(kt)
+  return activeStore
+}
+
+export function getCuStore(kt) {
+  if (activeStore && (!kt || activeKt === kt) && !activeStore.state.disposed) {
+    return activeStore
+  }
+  if (kt) {
+    return initCuStore(kt)
+  }
+  return activeStore
+}
+
+export function disposeCuStore(kt) {
+  if (!activeStore) return
+  if (kt && activeKt !== kt) return
+  activeStore.dispose()
+  activeStore = null
+  activeKt = null
+}
