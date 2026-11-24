@@ -277,7 +277,7 @@ DEFAULT_DENYLIST = (
     '1Password', 'Bitwarden', 'KeePass', 'CredentialUIBroker',
     'User Account Control', 'Windows Security', 'Taskmgr',
 )
-DEFAULT_POLICY = Policy('locked', True, 300, 'Ctrl+Alt+F12', DEFAULT_DENYLIST, ())
+DEFAULT_POLICY = Policy('locked', True, 0, 'Ctrl+Alt+F12', DEFAULT_DENYLIST, ())
 DESTRUCTIVE = re.compile(
     r'\b(delete|remove|erase|discard|wipe|destroy|uninstall|format|reset|terminate|shut down|'
     r'restart|sign out|log off|close|empty recycle bin)\b|删除|刪除|卸载|解除安裝|清除|清空|關閉|关闭|关机|關機|重置',

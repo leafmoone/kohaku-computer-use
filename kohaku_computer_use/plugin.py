@@ -41,27 +41,31 @@ class ComputerUsePlugin(BasePlugin):
 
     async def on_load(self, context: PluginContext) -> None:
         self._computer_context = context
+        if context.host_agent is not None:
+            await asyncio.to_thread(BROKER.track_agent, context.host_agent, context.agent_name, context.session_id, True)
         try:
             await asyncio.to_thread(BROKER.ensure_hotkey)
         except BrokerError as exc:
             log.warning('Computer-use hotkey startup failed: %s', exc)
 
-    def _release(self):
+    def _release(self, unload: bool):
         ctx = self._computer_context
         if ctx is not None:
             host = ctx.host_agent
+            if unload and host is not None:
+                BROKER.track_agent(host, ctx.agent_name, ctx.session_id, False)
             creature = getattr(host, 'creature_id', None) or getattr(host, '_creature_id', '')
             session_id = runtime_session_id(host, getattr(host, 'session', None)) or ctx.session_id
             BROKER.release(session_id, creature, ctx.agent_name)
 
     async def on_agent_stop(self) -> None:
-        await asyncio.to_thread(self._release)
+        await asyncio.to_thread(self._release, True)
 
     async def on_interrupt(self) -> None:
-        await asyncio.to_thread(self._release)
+        await asyncio.to_thread(self._release, False)
 
     async def on_unload(self) -> None:
-        await asyncio.to_thread(self._release)
+        await asyncio.to_thread(self._release, True)
         self._computer_context = None
 
     async def pre_tool_execute(self, args: dict, **kwargs) -> dict | None:

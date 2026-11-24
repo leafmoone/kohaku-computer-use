@@ -35,11 +35,13 @@ export function createCuStore(kt) {
     hoveredElementRef: null,
     popoverOpen: false,
     deckOpenCount: 0,
+    settingsOpenCount: 0,
     loadingStatus: false,
     loadingRoots: false,
     loadingObserve: false,
     loadingStates: false,
     savingPolicy: false,
+    lastIdleSeconds: 300,
     error: "",
     lastSyncedAt: 0,
     disposed: false,
@@ -49,11 +51,23 @@ export function createCuStore(kt) {
   let workDebounceTimer = null
   let pollInFlight = false
   let statusRequestSeq = 0
+  let policyWriteCount = 0
+  let panicEpoch = 0
   const stopHandles = []
+
+  function beginPolicyWrite() {
+    policyWriteCount += 1
+    state.savingPolicy = policyWriteCount > 0
+  }
+
+  function endPolicyWrite() {
+    policyWriteCount = Math.max(0, policyWriteCount - 1)
+    state.savingPolicy = policyWriteCount > 0
+  }
 
   function shouldPoll() {
     if (state.disposed) return false
-    if (state.popoverOpen || state.deckOpenCount > 0) return true
+    if (state.popoverOpen || state.deckOpenCount > 0 || state.settingsOpenCount > 0) return true
     return Boolean(state.status && state.status.mode !== "locked")
   }
 
@@ -83,12 +97,19 @@ export function createCuStore(kt) {
     }
   }
 
-  function applyStatus(payload) {
+  function applyStatus(payload, options) {
+    const opts = options && typeof options === "object" ? options : {}
     if (state.disposed || !payload || typeof payload !== "object") return
     const previousLatestId = state.status ? state.status.latest_state_id : null
+    const rawIdle = Number(payload.idle_timeout_s)
+    if (Number.isFinite(rawIdle) && rawIdle > 0) {
+      state.lastIdleSeconds = Math.round(rawIdle)
+    }
     state.status = payload
     state.lastSyncedAt = Date.now()
-    state.error = ""
+    if (opts.clearError === true) {
+      state.error = ""
+    }
     reconcilePolling()
     if (
       (state.deckOpenCount > 0 || state.popoverOpen) &&
@@ -115,7 +136,7 @@ export function createCuStore(kt) {
       if (state.disposed || reqSeq < statusRequestSeq) {
         return { ok: true, data: resp.data }
       }
-      applyStatus(resp.data)
+      applyStatus(resp.data, { clearError: !opts.silent })
       return { ok: true, data: resp.data }
     } catch (err) {
       const msg = extractApiError(err, "GET /status")
@@ -143,10 +164,17 @@ export function createCuStore(kt) {
       notify(msg, "error")
       return { ok: false, error: msg }
     }
-    state.savingPolicy = true
+    state.error = ""
+    beginPolicyWrite()
+    statusRequestSeq += 1
+    const startPanicEpoch = panicEpoch
     try {
       const resp = await kt.api.post("/policy", patch)
-      applyStatus(resp.data)
+      statusRequestSeq += 1
+      if (state.disposed || panicEpoch !== startPanicEpoch) {
+        return { ok: false, error: "Superseded by emergency lock", data: resp.data }
+      }
+      applyStatus(resp.data, { clearError: true })
       if (patch.mode !== undefined) {
         const loc = activeLocale()
         const actualMode = resp.data && resp.data.mode ? resp.data.mode : "locked"
@@ -176,17 +204,37 @@ export function createCuStore(kt) {
       notify(msg, "error")
       return { ok: false, error: msg }
     } finally {
-      state.savingPolicy = false
+      endPolicyWrite()
     }
+  }
+
+  async function toggleIdleAutoLock(enabled) {
+    const wantEnabled = Boolean(enabled)
+    const fallbackSeconds = state.lastIdleSeconds > 0 ? state.lastIdleSeconds : 300
+    const nextTimeout = wantEnabled ? fallbackSeconds : 0
+    const res = await setPolicy({ idle_timeout_s: nextTimeout })
+    if (res && res.ok) {
+      const loc = activeLocale()
+      const msg = wantEnabled
+        ? tForLocale(loc, "toast.idleEnabled", { seconds: nextTimeout })
+        : tForLocale(loc, "toast.idleDisabled")
+      notify(msg, "info")
+    }
+    return res
   }
 
   async function triggerPanic(reason) {
     if (state.disposed) return { ok: false, error: "Store disposed" }
     const safeReason = reason ? String(reason) : "ui_panic"
-    state.savingPolicy = true
+    state.error = ""
+    beginPolicyWrite()
+    panicEpoch += 1
+    statusRequestSeq += 1
     try {
       const resp = await kt.api.post("/panic", { reason: safeReason })
-      applyStatus(resp.data)
+      panicEpoch += 1
+      statusRequestSeq += 1
+      applyStatus(resp.data, { clearError: true })
       notify(tForLocale(activeLocale(), "toast.panicTriggered"), "warning")
       if (state.deckOpenCount > 0 || state.popoverOpen) {
         void fetchStates({ silent: true })
@@ -198,16 +246,23 @@ export function createCuStore(kt) {
       notify(msg, "error")
       return { ok: false, error: msg }
     } finally {
-      state.savingPolicy = false
+      endPolicyWrite()
     }
   }
 
   async function resetPanic() {
     if (state.disposed) return { ok: false, error: "Store disposed" }
-    state.savingPolicy = true
+    state.error = ""
+    beginPolicyWrite()
+    statusRequestSeq += 1
+    const startPanicEpoch = panicEpoch
     try {
       const resp = await kt.api.post("/panic/reset", {})
-      applyStatus(resp.data)
+      statusRequestSeq += 1
+      if (state.disposed || panicEpoch !== startPanicEpoch) {
+        return { ok: false, error: "Superseded by emergency lock", data: resp.data }
+      }
+      applyStatus(resp.data, { clearError: true })
       notify(tForLocale(activeLocale(), "toast.panicReset"), "info")
       if (state.deckOpenCount > 0 || state.popoverOpen) {
         void fetchStates({ silent: true })
@@ -219,7 +274,7 @@ export function createCuStore(kt) {
       notify(msg, "error")
       return { ok: false, error: msg }
     } finally {
-      state.savingPolicy = false
+      endPolicyWrite()
     }
   }
 
@@ -232,7 +287,7 @@ export function createCuStore(kt) {
       if (state.disposed) return { ok: true, data: resp.data }
       const list = Array.isArray(resp.data && resp.data.roots) ? resp.data.roots : []
       state.roots = list
-      state.error = ""
+      if (!opts.silent) state.error = ""
       return { ok: true, data: list }
     } catch (err) {
       const msg = extractApiError(err, "GET /roots")
@@ -269,7 +324,7 @@ export function createCuStore(kt) {
           : false
         if (!exists) state.selectedElementRef = null
       }
-      state.error = ""
+      if (!opts.silent) state.error = ""
       return { ok: true, data: resp.data }
     } catch (err) {
       const msg = extractApiError(err, `GET /state/${targetId}`)
@@ -296,7 +351,7 @@ export function createCuStore(kt) {
         : []
       state.states = statesList
       state.audit = auditList
-      state.error = ""
+      if (!opts.silent) state.error = ""
 
       if (statesList.length === 0) {
         state.selectedStateId = null
@@ -448,6 +503,17 @@ export function createCuStore(kt) {
     reconcilePolling()
   }
 
+  function enterSettings() {
+    state.settingsOpenCount += 1
+    reconcilePolling()
+    void fetchStatus({ silent: true })
+  }
+
+  function leaveSettings() {
+    state.settingsOpenCount = Math.max(0, state.settingsOpenCount - 1)
+    reconcilePolling()
+  }
+
   function setSelectedElement(ref) {
     state.selectedElementRef = ref ? String(ref) : null
   }
@@ -490,6 +556,9 @@ export function createCuStore(kt) {
     state.disposed = true
     state.popoverOpen = false
     state.deckOpenCount = 0
+    state.settingsOpenCount = 0
+    policyWriteCount = 0
+    state.savingPolicy = false
     clearTimers()
     while (stopHandles.length > 0) {
       const stop = stopHandles.pop()
@@ -509,6 +578,7 @@ export function createCuStore(kt) {
     clearError,
     fetchStatus,
     setPolicy,
+    toggleIdleAutoLock,
     triggerPanic,
     resetPanic,
     fetchRoots,
@@ -521,6 +591,8 @@ export function createCuStore(kt) {
     togglePopover,
     enterDeck,
     leaveDeck,
+    enterSettings,
+    leaveSettings,
     setSelectedElement,
     setHoveredElement,
     isPollingActive: () => pollTimer !== null,

@@ -19,6 +19,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
+from weakref import ReferenceType, ref
 
 from .models import (
     DEFAULT_POLICY,
@@ -62,6 +63,11 @@ class BrokerError(Exception):
         self.status, self.outcome = status, outcome
 
 
+def _plugin_enabled(agent: object) -> bool:
+    manager = getattr(agent, 'plugin_manager', None) or getattr(agent, 'plugins', None)
+    return manager is not None and manager.is_enabled('computer_use')
+
+
 def runtime_session_id(agent: object, session: object) -> str:
     return str(getattr(getattr(agent, 'session_store', None), 'session_id', None)
                or getattr(session, 'session_id', None) or getattr(session, 'key', None) or '')
@@ -100,15 +106,19 @@ def action_needs_confirmation(snapshot: Snapshot, actions: list[Action]) -> bool
 
 
 class WorkerPipe:
-    def __init__(self, hotkey: str, event: Callable):
+    def __init__(self, hotkey: str | None, event: Callable):
         from kohakuterrarium.utils.interpreter import python_command
 
         env = os.environ.copy()
         package_parent = str(Path(__file__).resolve().parent.parent)
         env['PYTHONPATH'] = os.pathsep.join(filter(None, [package_parent, env.get('PYTHONPATH')]))
         env['PYTHONIOENCODING'] = 'utf-8'
+        self.hotkey = hotkey
+        command = [*python_command(), '-m', 'kohaku_computer_use.win_worker']
+        if hotkey is not None:
+            command.append(hotkey)
         self.process = subprocess.Popen(
-            [*python_command(), '-m', 'kohaku_computer_use.win_worker', hotkey],
+            command,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding='utf-8', errors='replace', env=env,
             creationflags=subprocess.CREATE_NO_WINDOW,
@@ -166,6 +176,8 @@ class DesktopBroker:
         self.deadline: float | None = None
         self.timer: threading.Timer | None = None
         self.lease: Lease | None = None
+        self._agents: list[tuple[ReferenceType[object], str, str]] = []
+        self._had_enabled_agent = False
         self.approvals: dict[str, Approval] = {}
         self.states: deque[Snapshot] = deque(maxlen=16)
         self.audit: deque[AuditEntry] = deque(maxlen=30)
@@ -175,7 +187,6 @@ class DesktopBroker:
         self.lock = threading.RLock()
         self.calls = threading.Lock()
         self.worker: WorkerPipe | None = None
-        self.worker_started = False
         self.serial = 0
         self.pending: tuple[int, queue.Queue] | None = None
         self.inflight: tuple[Actor, str] | None = None
@@ -198,7 +209,6 @@ class DesktopBroker:
     def _stop_worker(self, reason: str):
         worker, self.worker = self.worker, None
         self.hotkey_registered = False
-        self.roots.clear()
         if self.pending is not None:
             self.pending[1].put({'interrupted': reason})
             self.pending = None
@@ -209,6 +219,13 @@ class DesktopBroker:
                 log.exception('Could not reap desktop worker')
                 self.tripped, self.trip_reason = True, 'worker_reap_failed'
                 self.worker = worker
+            finally:
+                worker.ready.set()
+
+    def _finish_locked_read(self):
+        # Window references are broker-owned and survive a temporary UIA-only worker.
+        if self.policy.mode == 'locked' and self.worker is not None and self.worker.hotkey is None:
+            self._stop_worker('locked_read_finished')
 
     def _lock_mode(self, reason: str, stop_worker: bool):
         old = self.policy.mode
@@ -226,7 +243,7 @@ class DesktopBroker:
     def _idle(self):
         with self.lock:
             if self.deadline is not None and self.deadline <= time.monotonic():
-                self._lock_mode('idle_timeout', self.pending is not None)
+                self._lock_mode('idle_timeout', True)
 
     def _touch(self):
         if self.timer:
@@ -245,20 +262,22 @@ class DesktopBroker:
             raise BrokerError(501, 'unsupported_platform', 'blocked')
         if self.tripped:
             raise BrokerError(409, 'panic_latched', 'blocked')
-        if self.worker is None:
-            self.worker_started = True
+        worker = self.worker
+        if worker is None:
             try:
-                self.worker = WorkerPipe(self.policy.hotkey, self._worker_event)
-                self.worker.start()
+                hotkey = self.policy.hotkey if self.policy.mode != 'locked' else None
+                worker = WorkerPipe(hotkey, self._worker_event)
+                self.worker = worker
+                worker.start()
             except OSError as exc:
                 log.warning('Desktop worker start failed: %s', exc)
                 self._lock_mode('worker_start_failed', True)
                 raise BrokerError(503, 'worker_start_failed', 'blocked') from exc
-        return self.worker
+        return worker
 
     def _retry_unavailable_worker(self):
         worker = self.worker
-        if worker is not None and (worker.process.poll() is not None or
+        if worker is not None and (worker.hotkey != self.policy.hotkey or worker.process.poll() is not None or
                                    (worker.ready.is_set() and not self.hotkey_registered)):
             self._stop_worker('retry_hotkey')
             if self.tripped:
@@ -266,9 +285,8 @@ class DesktopBroker:
 
     def ensure_hotkey(self):
         with self.lock:
-            if not self.supported or self.tripped:
-                return
-            if self.worker is None and self.worker_started:
+            self._idle()
+            if not self.supported or self.tripped or self.policy.mode == 'locked':
                 return
             self._retry_unavailable_worker()
             worker = self._spawn()
@@ -280,19 +298,18 @@ class DesktopBroker:
                 return
             event = message.get('event')
             if event == 'hotkey_registration':
+                if self.tripped or self.policy.mode == 'locked' or worker.hotkey is None:
+                    return
                 self.hotkey_registered = bool(message['registered'])
                 if not self.hotkey_registered:
                     log.warning('Could not register desktop hotkey %s (Windows error %s)', message['hotkey'], message.get('error'))
                     if self.policy.mode in ('confirm', 'armed'):
-                        self._lock_mode('hotkey_unavailable', self.pending is not None)
+                        self._lock_mode('hotkey_unavailable', True)
                 worker.ready.set()
             elif event == 'hotkey_panic':
                 self.panic(f'Global hotkey {message["hotkey"]}', 'hotkey')
             elif event == 'worker_exit':
                 self._lock_mode('worker_exit', True)
-                if self.worker is None:
-                    self.worker_started = False
-                worker.ready.set()
             elif self.pending is not None and message.get('id') == self.pending[0]:
                 self.pending[1].put(message)
 
@@ -305,6 +322,11 @@ class DesktopBroker:
             request['id'] = self.serial
             replies = queue.Queue()
             guard()
+            if self.worker is not worker:
+                raise BrokerError(409, 'worker_replaced', 'blocked')
+            if worker.process.poll() is not None:
+                self._lock_mode('worker_exit', True)
+                raise BrokerError(409, 'worker_exit', 'blocked')
             self.pending = (self.serial, replies)
             worker.outgoing.put(request)
         try:
@@ -325,8 +347,32 @@ class DesktopBroker:
             raise BrokerError(status, reason, 'unknown' if mutating else 'blocked')
         return reply['result']
 
+    def track_agent(self, host: object, agent_name: str, session_id: str, loaded: bool):
+        with self.lock:
+            self._agents = [item for item in self._agents if item[0]() is not host]
+            if loaded:
+                self._agents.append((ref(host), agent_name, session_id))
+            self._reconcile_plugin_disable()
+
+    def _reconcile_plugin_disable(self):
+        self._agents = [item for item in self._agents if item[0]() is not None]
+        hosts = [(host, name, session, _plugin_enabled(host))
+                 for handle, name, session in self._agents if (host := handle()) is not None]
+        enabled = any(active for _, _, _, active in hosts)
+        if self._had_enabled_agent and not enabled:
+            if self.policy.mode != 'locked':
+                self._lock_mode('plugin_disabled', True)
+            else:
+                self._invalidate()
+        for host, name, session, active in hosts:
+            if not active:
+                creature = getattr(host, 'creature_id', None) or getattr(host, '_creature_id', '')
+                self.release(runtime_session_id(host, getattr(host, 'session', None)) or session, creature, name)
+        self._had_enabled_agent = enabled
+
     def status(self) -> StatusPayload:
         with self.lock:
+            self._reconcile_plugin_disable()
             self._idle()
             lease = self.lease
             payload = asdict(self.policy)
@@ -343,6 +389,7 @@ class DesktopBroker:
 
     def change_policy(self, changes: dict) -> StatusPayload:
         with self.lock:
+            self._reconcile_plugin_disable()
             mode = changes.get('mode', self.policy.mode)
             if self.tripped and mode != 'locked':
                 raise BrokerError(409, 'panic_latched', 'blocked')
@@ -363,23 +410,28 @@ class DesktopBroker:
             old = self.policy
             new = replace(old, **changes)
             if old == new:
+                if new.mode == 'locked' and self.trip_reason == 'worker_reap_failed':
+                    self._stop_worker('operator_lock')
+                    if self.worker is not None:
+                        raise BrokerError(503, 'worker_reap_failed', 'blocked')
                 if new.mode not in ('confirm', 'armed'):
                     return self.status()
                 new = old
             else:
-                if self.pending is not None or old.hotkey != new.hotkey:
+                if new.mode != 'locked' and (self.pending is not None or old.hotkey != new.hotkey):
                     self._stop_worker('policy_changed')
                 if self.tripped:
                     new = replace(new, mode='locked')
                 self._invalidate()
                 self.policy = new
                 if new.mode == 'locked':
-                    self._lock_mode('operator_lock', False)
+                    self._lock_mode('operator_lock', True)
                 else:
                     self._touch()
                 self._record(OPERATOR, 'mode_change', None, f'{old.mode} → {new.mode}', 'info')
-            start = self.supported and not self.tripped and (old.hotkey != new.hotkey or new.mode != 'locked')
-            if not start:
+            if self.tripped or new.mode == 'locked':
+                if self.worker is not None:
+                    raise BrokerError(503, 'worker_reap_failed', 'blocked')
                 return self.status()
             self._retry_unavailable_worker()
             worker = self._spawn()
@@ -392,9 +444,9 @@ class DesktopBroker:
                     raise BrokerError(409, 'panic_latched', 'blocked')
                 if (not ready or self.worker is not worker or not status['worker_alive']
                         or not status['hotkey_registered']):
-                    # Do not overwrite a newer policy while this request was waiting.
-                    if self.policy is new:
-                        self._lock_mode('hotkey_unavailable', False)
+                    # A newer request may have replaced the worker without changing the policy.
+                    if self.policy is new and self.worker is worker:
+                        self._lock_mode('hotkey_unavailable', True)
                     raise BrokerError(409, f'hotkey_unavailable: Global hotkey {new.hotkey} is unavailable or occupied by another process', 'blocked')
                 if self.policy is not new:
                     raise BrokerError(409, 'desktop_policy_changed', 'blocked')
@@ -409,13 +461,10 @@ class DesktopBroker:
 
     def reset_panic(self) -> StatusPayload:
         with self.lock:
-            if self.worker and self.tripped:
-                self._stop_worker('panic_reset')
-                if self.worker:
-                    raise BrokerError(503, 'worker_reap_failed', 'blocked')
-            self._lock_mode('panic_reset', False)
+            self._lock_mode('panic_reset', True)
+            if self.worker is not None:
+                raise BrokerError(503, 'worker_reap_failed', 'blocked')
             self.tripped, self.trip_reason = False, None
-            self.worker_started = False
             self._record(OPERATOR, 'panic_reset', None, 'Panic reset; desktop remains locked', 'info')
             return self.status()
 
@@ -442,8 +491,7 @@ class DesktopBroker:
             raise BrokerError(501, 'unsupported_platform', 'blocked')
         if context is not None:
             actor = actor_for(context)
-            manager = getattr(context.agent, 'plugin_manager', None) or getattr(context.agent, 'plugins', None)
-            if manager is None or not manager.is_enabled('computer_use'):
+            if not _plugin_enabled(context.agent):
                 raise BrokerError(403, 'computer_use_plugin_disabled', 'blocked')
             if self.policy.mode == 'locked' or (mutate and self.policy.mode == 'read_only'):
                 raise BrokerError(403, f'desktop_{self.policy.mode}', 'blocked')
@@ -499,14 +547,23 @@ class DesktopBroker:
     def list_roots(self, context: ToolContext | None) -> list[RootItem]:
         def guard():
             self._gate(context, False)
+            if generation != self.generation:
+                raise BrokerError(409, 'desktop_policy_or_lease_changed', 'blocked')
 
         with self.calls:
-            listed = self._list(guard)
             with self.lock:
-                guard()
-                if context is not None:
-                    self._touch()
-                return [public_root(root) for root in listed]
+                self._gate(context, False)
+                generation = self.generation
+            try:
+                listed = self._list(guard)
+                with self.lock:
+                    guard()
+                    if context is not None:
+                        self._touch()
+                    return [public_root(root) for root in listed]
+            finally:
+                with self.lock:
+                    self._finish_locked_read()
 
     def _target(self, root_ref: str | None, hwnd: int | None, guard: Callable[[], None]) -> WorkerRoot:
         with self.lock:
@@ -649,6 +706,7 @@ class DesktopBroker:
             finally:
                 with self.lock:
                     self.inflight = None
+                    self._finish_locked_read()
 
     def query(self, context: ToolContext, state_id: str) -> StateDetail:
         def guard():

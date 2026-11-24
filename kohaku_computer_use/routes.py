@@ -61,11 +61,6 @@ def http_error(exc: BrokerError) -> HTTPException:
 
 @router.get('/status')
 def status(broker: Desktop) -> StatusPayload:
-    try:
-        broker.ensure_hotkey()
-    except BrokerError as exc:
-        if exc.status != 503:
-            raise http_error(exc) from exc
     return broker.status()
 
 

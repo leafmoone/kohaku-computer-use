@@ -10,6 +10,7 @@ import { syncSettingsHostLabels, useI18n } from "./i18n.js"
 import { getCuStore } from "./store.js"
 import {
   DEFAULT_DENYLIST_PATTERNS,
+  MODES,
   joinPatternLines,
   modeBadgeKey,
   splitPatternLines,
@@ -17,11 +18,17 @@ import {
   validateRegexPatterns,
 } from "./utils.js"
 
-function buildDraftFromStatus(status) {
+function buildDraftFromStatus(status, fallbackSeconds) {
+  const rawTimeout = status ? Number(status.idle_timeout_s) : 0
+  const idleEnabled = Boolean(Number.isFinite(rawTimeout) && rawTimeout > 0)
+  const duration = idleEnabled
+    ? Math.round(rawTimeout)
+    : Number.isFinite(Number(fallbackSeconds)) && Number(fallbackSeconds) > 0
+      ? Math.round(Number(fallbackSeconds))
+      : 300
   return {
-    idleTimeoutText: String(
-      status && Number.isFinite(Number(status.idle_timeout_s)) ? status.idle_timeout_s : 300,
-    ),
+    idleEnabled,
+    idleTimeoutText: String(duration),
     allowForegroundInput: status ? status.allow_foreground_input !== false : true,
     hotkey: status && status.hotkey ? String(status.hotkey) : "Ctrl+Alt+F12",
     denylistText: joinPatternLines(
@@ -42,11 +49,12 @@ export default defineComponent({
     const store = getCuStore(kt)
     const { locale, t } = useI18n()
 
-    const draft = reactive(buildDraftFromStatus(store.state.status))
+    const draft = reactive(buildDraftFromStatus(store.state.status, store.state.lastIdleSeconds))
     const dirty = reactive({ value: false })
 
     function applyStatusToDraft(status) {
-      const next = buildDraftFromStatus(status)
+      const next = buildDraftFromStatus(status, store.state.lastIdleSeconds)
+      draft.idleEnabled = next.idleEnabled
       draft.idleTimeoutText = next.idleTimeoutText
       draft.allowForegroundInput = next.allowForegroundInput
       draft.hotkey = next.hotkey
@@ -60,6 +68,9 @@ export default defineComponent({
       currentStatus.value && currentStatus.value.mode ? currentStatus.value.mode : "locked",
     )
     const trippedValue = computed(() => Boolean(currentStatus.value && currentStatus.value.tripped))
+    const supportedValue = computed(() =>
+      currentStatus.value ? currentStatus.value.supported !== false : true,
+    )
     const stateLabel = computed(() => t(modeBadgeKey(modeValue.value, trippedValue.value)))
     const tone = computed(() => statusTone(modeValue.value, trippedValue.value))
 
@@ -74,7 +85,7 @@ export default defineComponent({
       const trimmed = String(draft.idleTimeoutText || "").trim()
       if (!/^\d+$/.test(trimmed)) return null
       const parsed = Number(trimmed)
-      if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > 3600) return null
+      if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 3600) return null
       return parsed
     })
 
@@ -82,7 +93,7 @@ export default defineComponent({
 
     const hasValidationError = computed(
       () =>
-        timeoutNumber.value === null ||
+        (draft.idleEnabled && timeoutNumber.value === null) ||
         !hotkeyTrimmed.value ||
         !denylistCheck.value.valid ||
         !allowlistCheck.value.valid,
@@ -109,23 +120,42 @@ export default defineComponent({
     )
 
     onMounted(() => {
+      store.enterSettings()
       if (typeof document !== "undefined") {
         syncSettingsHostLabels(locale.value, document)
         void nextTick().then(() => syncSettingsHostLabels(locale.value, document))
-      }
-      if (!store.state.status) {
-        void store.fetchStatus({ silent: true })
       }
     })
 
     onBeforeUnmount(() => {
       stopStatusWatch()
       stopLocaleWatch()
+      store.leaveSettings()
     })
 
     function onTimeoutInput(event) {
       draft.idleTimeoutText = event && event.target ? String(event.target.value) : ""
       dirty.value = true
+    }
+
+    async function onIdleToggleChange(event) {
+      const checked = Boolean(event && event.target && event.target.checked)
+      draft.idleEnabled = checked
+      if (checked) {
+        const parsed = timeoutNumber.value
+        const seconds =
+          parsed !== null
+            ? parsed
+            : store.state.lastIdleSeconds > 0
+              ? store.state.lastIdleSeconds
+              : 300
+        draft.idleTimeoutText = String(seconds)
+        store.state.lastIdleSeconds = seconds
+      }
+      const res = await store.toggleIdleAutoLock(checked)
+      if (res && res.ok && !dirty.value) {
+        applyStatusToDraft(res.data)
+      }
     }
 
     function onForegroundChange(event) {
@@ -153,7 +183,7 @@ export default defineComponent({
     }
 
     async function savePolicy() {
-      if (timeoutNumber.value === null) {
+      if (draft.idleEnabled && timeoutNumber.value === null) {
         notify(t("settings.invalidTimeout"), "error")
         return
       }
@@ -173,7 +203,7 @@ export default defineComponent({
       }
 
       const res = await store.setPolicy({
-        idle_timeout_s: timeoutNumber.value,
+        idle_timeout_s: draft.idleEnabled ? timeoutNumber.value : 0,
         allow_foreground_input: Boolean(draft.allowForegroundInput),
         hotkey: hotkeyTrimmed.value,
         denylist_patterns: splitPatternLines(draft.denylistText),
@@ -187,7 +217,7 @@ export default defineComponent({
 
     async function resetDefaults() {
       const res = await store.setPolicy({
-        idle_timeout_s: 300,
+        idle_timeout_s: 0,
         allow_foreground_input: true,
         hotkey: "Ctrl+Alt+F12",
         denylist_patterns: [...DEFAULT_DENYLIST_PATTERNS],
@@ -204,9 +234,17 @@ export default defineComponent({
       const hotkeyStatusText = status
         ? status.hotkey_registered
           ? t("settings.hotkeyReady", { hotkey: status.hotkey })
-          : t("settings.hotkeyUnavailable", { hotkey: status.hotkey })
+          : modeValue.value === "locked"
+            ? t("settings.hotkeyStandby", { hotkey: status.hotkey })
+            : t("settings.hotkeyUnavailable", { hotkey: status.hotkey })
         : ""
-      const hotkeyTone = status && status.hotkey_registered ? "ok" : "warn"
+      const hotkeyTone = status
+        ? status.hotkey_registered
+          ? "ok"
+          : modeValue.value === "locked"
+            ? "muted"
+            : "warn"
+        : "muted"
 
       const denylistStatus = !denylistCheck.value.valid
         ? t("settings.invalidRegex", {
@@ -243,6 +281,55 @@ export default defineComponent({
                   tone: trippedValue.value ? "error" : tone.value === "armed" ? "ok" : "muted",
                 },
                 {
+                  detail: () =>
+                    h("div", { class: "kcu-settings-mode-wrap" }, [
+                      h(
+                        "div",
+                        {
+                          class: "kcu-mode-segment",
+                          role: "group",
+                          "aria-label": t("deck.modeLabel"),
+                        },
+                        MODES.map((mode) => {
+                          const active = !trippedValue.value && modeValue.value === mode
+                          const disabledTitle = trippedValue.value
+                            ? t("deck.lockedByPanicHint")
+                            : !supportedValue.value
+                              ? t("deck.unsupportedBanner", {
+                                  platform: status ? status.platform : "unknown",
+                                })
+                              : null
+                          return h(
+                            "button",
+                            {
+                              key: mode,
+                              type: "button",
+                              class: active
+                                ? `kcu-mode-btn is-active kcu-state-${mode}`
+                                : "kcu-mode-btn",
+                              "data-test": `kcu-settings-mode-${mode}`,
+                              title: disabledTitle,
+                              disabled:
+                                trippedValue.value ||
+                                !supportedValue.value ||
+                                store.state.savingPolicy,
+                              onClick: () => void store.setPolicy({ mode }),
+                            },
+                            t(`mode.${mode}`),
+                          )
+                        }),
+                      ),
+                      trippedValue.value
+                        ? h(
+                            "div",
+                            {
+                              class: "kcu-mode-panic-hint",
+                              "data-test": "kcu-settings-panic-hint",
+                            },
+                            t("deck.lockedByPanicHint"),
+                          )
+                        : null,
+                    ].filter(Boolean)),
                   default: () =>
                     [
                       trippedValue.value
@@ -251,6 +338,7 @@ export default defineComponent({
                             {
                               variant: "primary",
                               size: "sm",
+                              "data-test": "kcu-settings-reset-panic",
                               disabled: store.state.savingPolicy,
                               onClick: () => void store.resetPanic(),
                             },
@@ -262,6 +350,7 @@ export default defineComponent({
                         {
                           variant: "secondary",
                           size: "sm",
+                          "data-test": "kcu-settings-open-deck",
                           onClick: () => kt.openTab("deck"),
                         },
                         { default: () => t("settings.openDeck") },
@@ -274,20 +363,41 @@ export default defineComponent({
                 {
                   title: t("settings.idleTimeoutTitle"),
                   hint: t("settings.idleTimeoutHint"),
-                  status: timeoutNumber.value === null ? t("settings.invalidTimeout") : "",
-                  tone: timeoutNumber.value === null ? "error" : "muted",
+                  status:
+                    draft.idleEnabled && timeoutNumber.value === null
+                      ? t("settings.invalidTimeout")
+                      : "",
+                  tone: draft.idleEnabled && timeoutNumber.value === null ? "error" : "muted",
                   inline: true,
                 },
                 {
                   default: () =>
                     h("div", { class: "kcu-input-inline" }, [
+                      h("label", { class: "kcu-switch-inline" }, [
+                        h("input", {
+                          type: "checkbox",
+                          class: "kcu-checkbox",
+                          "data-test": "kcu-settings-idle-toggle",
+                          checked: Boolean(draft.idleEnabled),
+                          disabled: store.state.savingPolicy || !supportedValue.value,
+                          onChange: (event) => void onIdleToggleChange(event),
+                        }),
+                        h(
+                          "span",
+                          null,
+                          draft.idleEnabled
+                            ? t("settings.idleEnabledLabel")
+                            : t("popover.idleDisabled"),
+                        ),
+                      ]),
                       h("input", {
                         type: "number",
-                        min: "0",
+                        min: "1",
                         max: "3600",
                         step: "10",
                         class: "kcu-input kcu-input-number",
                         "data-test": "kcu-settings-idle-timeout",
+                        disabled: !draft.idleEnabled,
                         value: draft.idleTimeoutText,
                         onInput: onTimeoutInput,
                       }),

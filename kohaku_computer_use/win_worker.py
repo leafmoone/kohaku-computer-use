@@ -785,10 +785,10 @@ def main():
             protocol.write(line + '\n')
             protocol.flush()
 
-    hotkey = sys.argv[1]
     mta = threading.Thread(target=uia_loop, args=(requests, emit), name='computer-use-uia', daemon=True)
     mta.start()
-    threading.Thread(target=hotkey_loop, args=(hotkey, emit), name='computer-use-hotkey', daemon=True).start()
+    if len(sys.argv) > 1:
+        threading.Thread(target=hotkey_loop, args=(sys.argv[1], emit), name='computer-use-hotkey', daemon=True).start()
     for line in sys.stdin:
         requests.put(json.loads(line))
     requests.put(None)

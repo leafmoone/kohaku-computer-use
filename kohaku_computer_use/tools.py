@@ -6,9 +6,10 @@ import base64
 import json
 import re
 from copy import deepcopy
-from typing import get_args
+from typing import cast, get_args
 
 from jsonschema import Draft202012Validator
+from kohakuterrarium.llm.base import ToolSchema
 from kohakuterrarium.llm.message import ImagePart, TextPart
 from kohakuterrarium.modules.tool.base import (
     BaseTool,
@@ -36,25 +37,54 @@ def integer(minimum: int, maximum: int) -> dict:
 
 BOOL = {'type': 'boolean'}
 STATE_ID = string(64, True)
-REF = {'type': 'string', 'pattern': '^@e[1-9][0-9]*$', 'maxLength': 12}
+REF = {
+    'type': 'string', 'pattern': r'^@e[1-9][0-9]*\Z', 'maxLength': 12,
+    'description': 'Element reference like @e1 from the current state.',
+}
 EXPECT = schema({'text': string(240, True), 'role': string(100, True), 'gone': BOOL, 'timeout_ms': integer(0, 5000)}, [])
 ACTION = schema({
-    'action': {'enum': list(get_args(ActionName))}, 'ref': REF,
+    'action': {'type': 'string', 'enum': list(get_args(ActionName))}, 'ref': REF,
     'x': integer(-2**31, 2**31 - 1), 'y': integer(-2**31, 2**31 - 1),
-    'text': string(4000, False), 'key': string(40, True), 'clear_first': BOOL,
-    'direction': {'enum': ['up', 'down', 'left', 'right']}, 'amount': integer(1, 10), 'expect': EXPECT,
+    'text': string(4000, False),
+    'key': {**string(40, True), 'description': 'Key chord like Enter or Ctrl+S.'},
+    'clear_first': BOOL, 'direction': {'type': 'string', 'enum': ['up', 'down', 'left', 'right']},
+    'amount': integer(1, 10), 'expect': EXPECT,
 }, ['action'])
-SCHEMAS = {
+STRICT_SCHEMAS = {
     'cu_roots': schema({}, []),
-    'cu_observe': schema({'root_ref': {'type': ['string', 'null'], 'pattern': '^@r[1-9][0-9]*$', 'maxLength': 16},
-                          'hwnd': {'type': ['integer', 'null'], 'minimum': 1, 'maximum': 2**63 - 1},
-                          'include_image': BOOL, 'max_elements': integer(1, 512)}, []),
+    'cu_observe': schema({
+        'root_ref': {'type': 'string', 'pattern': r'^@r[1-9][0-9]*\Z', 'maxLength': 16,
+                     'description': 'Window reference like @r1 from cu_roots.'},
+        'hwnd': {**integer(1, 2**63 - 1), 'description': 'Numeric window handle from cu_roots.'},
+        'include_image': BOOL, 'max_elements': integer(1, 512),
+    }, []),
     'cu_query': schema({'state_id': STATE_ID, 'ref': REF, 'text': string(240, True), 'role': string(100, True),
                         'limit': integer(1, 512)}, ['state_id']),
     'cu_act': schema({'state_id': STATE_ID, 'actions': {'type': 'array', 'items': ACTION, 'minItems': 1, 'maxItems': 8}},
                      ['state_id', 'actions']),
 }
-VALIDATORS = {name: Draft202012Validator(value) for name, value in SCHEMAS.items()}
+PROVIDER_SCHEMA_KEYS = frozenset({
+    'type', 'properties', 'required', 'items', 'enum', 'description', 'minimum', 'maximum',
+    'minItems', 'maxItems', 'additionalProperties',
+})
+MAX_SAFE_JSON_INTEGER = 2**53 - 1
+
+
+def provider_schema(node: dict) -> dict:
+    result = {key: deepcopy(value) for key, value in node.items()
+              if key in PROVIDER_SCHEMA_KEYS and key not in ('properties', 'items')}
+    if result.get('maximum', 0) > MAX_SAFE_JSON_INTEGER:
+        # Keep full-width HWND validation local; some providers parse JSON numbers as doubles.
+        del result['maximum']
+    if 'properties' in node:
+        result['properties'] = {key: provider_schema(value) for key, value in node['properties'].items()}
+    if 'items' in node:
+        result['items'] = provider_schema(node['items'])
+    return result
+
+
+TOOL_SCHEMAS = {name: provider_schema(value) for name, value in STRICT_SCHEMAS.items()}
+VALIDATORS = {name: Draft202012Validator(value) for name, value in STRICT_SCHEMAS.items()}
 DESCRIPTIONS = {
     'cu_roots': 'List visible Windows desktop roots and their state-independent window references.',
     'cu_observe': 'Observe a window and acquire a creature lease with state-scoped UI Automation references.',
@@ -76,11 +106,27 @@ DOCS = {
 VISION_EXCLUDED = re.compile(r'(?:^|[/.:])deepseek-(?:chat|reasoner)(?:$|[:@])', re.IGNORECASE)
 
 
+def omit_optional_nulls(value: object, node: dict) -> object:
+    if isinstance(value, dict) and node['type'] == 'object':
+        properties = node['properties']
+        required = node['required']
+        return {
+            key: omit_optional_nulls(item, properties[key]) if key in properties else item
+            for key, item in value.items()
+            if item is not None or key not in properties or key in required
+        }
+    if isinstance(value, list) and node['type'] == 'array':
+        return [omit_optional_nulls(item, node['items']) for item in value]
+    return value
+
+
 def validate_args(tool: str, args: dict) -> dict:
-    error = next(VALIDATORS[tool].iter_errors(args), None)
+    normalized = omit_optional_nulls(args, STRICT_SCHEMAS[tool])
+    error = next(VALIDATORS[tool].iter_errors(normalized), None)
     if error is not None:
         path = '.'.join(str(part) for part in error.absolute_path) or 'arguments'
         raise BrokerError(422, f'invalid {path} ({error.validator})', 'blocked')
+    args = cast(dict, normalized)
     if tool != 'cu_act':
         for field in ('hwnd', 'max_elements', 'limit'):
             value = args.get(field)
@@ -111,8 +157,12 @@ def validate_args(tool: str, args: dict) -> dict:
                 parse_chord(item['key'], False)
             except ValueError as exc:
                 raise BrokerError(422, 'invalid_key_chord', 'blocked') from exc
-        if 'expect' in item and not ({'text', 'role'} & item['expect'].keys()):
-            raise BrokerError(422, 'expect_requires_text_or_role', 'blocked')
+        if 'expect' in item:
+            expect = item['expect']
+            if not ({'text', 'role'} & expect.keys()):
+                raise BrokerError(422, 'expect_requires_text_or_role', 'blocked')
+            if 'timeout_ms' in expect and not isinstance(expect['timeout_ms'], int):
+                raise BrokerError(422, 'timeout_ms_must_be_integer', 'blocked')
         # The JSON Schema integer type also accepts numerically integral floats.
         for field in ('x', 'y', 'amount'):
             if field in item and not isinstance(item[field], int):
@@ -157,8 +207,15 @@ class ComputerUseTool(BaseTool):
     def description(self) -> str:
         return DESCRIPTIONS[self.tool_name]
 
+    @property
+    def parameters(self) -> dict:
+        return deepcopy(TOOL_SCHEMAS[self.tool_name])
+
     def get_parameters_schema(self) -> dict:
-        return deepcopy(SCHEMAS[self.tool_name])
+        return self.parameters
+
+    def to_schema(self) -> ToolSchema:
+        return ToolSchema(name=self.tool_name, description=self.description, parameters=self.parameters)
 
     def get_full_documentation(self, tool_format: str = 'native') -> str:
         return f'# {self.tool_name}\n\n{self.description}\n\n{DOCS[self.tool_name]}'

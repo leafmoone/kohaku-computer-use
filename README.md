@@ -19,7 +19,9 @@ Desktop access requires an interactive Windows session. The REST API is availabl
 
 The mode, idle timeout, optional foreground input, and case-insensitive denylist and allowlist patterns are configured in **Computer Use** settings. Denylist matches cannot be overridden by the allowlist. Disabling foreground input leaves supported background UI Automation patterns available. Foreground fallback verifies window identity, foreground state, focus when applicable, and occlusion before injecting. Elevated or unverifiable targets cannot receive actions.
 
-**Emergency lock:** press **Ctrl+Alt+F12** (configurable Windows global hotkey) or run **Emergency Lock Computer Use** in the app (**Ctrl+Alt+X**). Panic terminates the worker, releases the desktop lease and latches the broker in Locked. Resetting panic leaves it Locked; explicitly select another mode only when it is safe. If the panic hotkey cannot be registered, mutations are blocked. The broker also returns to Locked after inactivity or a worker timeout. Lock cannot undo input already delivered.
+**Idle auto-lock is off by default** (`idle_timeout_s: 0`). Turn it on in **Computer Use** settings and choose an inactivity timeout. Turning it off cancels the countdown without changing the current mode.
+
+**Emergency lock:** press **Ctrl+Alt+F12** (configurable Windows global hotkey) or run **Emergency Lock Computer Use** in the app (**Ctrl+Alt+X**). Panic terminates the worker, releases the desktop lease and latches the broker in Locked. Resetting panic leaves it Locked; explicitly select another mode only when it is safe. If the panic hotkey cannot be registered, mutations are blocked. A worker timeout still locks the broker even if idle auto-lock is off. Lock cannot undo input already delivered.
 
 ## Creature tools
 

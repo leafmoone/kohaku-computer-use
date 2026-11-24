@@ -7,10 +7,6 @@
   order: 1;
 }
 
-[data-test="v2-dock"] > .kt-v2-float:not([data-test="v2-dock-more-menu"]):has([data-test="v2-dock-pill"]) > .kcu-dock-slot {
-  display: none;
-}
-
 [data-test="v2-dock"] > .kt-v2-float:not([data-test="v2-dock-more-menu"]) > [data-test="v2-dock-more"] {
   order: 2;
 }
@@ -165,6 +161,25 @@ html.dark .kcu-state-tripped {
   box-shadow: var(--kcu-shadow);
   font-size: var(--kt-fs-caption, 12px);
   line-height: 1.2;
+}
+
+.kcu-pill-mode-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px;
+  border-radius: 9999px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.kcu-pill-mode-btn:hover {
+  background: var(--kcu-state-bg);
+  border-color: var(--kcu-state-border);
 }
 
 .kcu-pill-dot {
@@ -528,6 +543,15 @@ html.dark .kcu-banner-danger {
 
 html.dark .kcu-kpi-live {
   color: #34d399;
+}
+
+.kcu-kpi-warn {
+  border-color: rgba(217, 119, 6, 0.45);
+  color: #b45309;
+}
+
+html.dark .kcu-kpi-warn {
+  color: #fbbf24;
 }
 
 .kcu-strip-controls {
@@ -1061,12 +1085,18 @@ html.dark .kcu-tone-info {
   color: var(--kcu-text-muted);
 }
 
-.kcu-switch-label {
+.kcu-switch-label,
+.kcu-switch-inline {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   font-size: 12px;
   cursor: pointer;
+}
+
+.kcu-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .kcu-checkbox {
@@ -1081,4 +1111,12 @@ html.dark .kcu-tone-info {
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.kcu-settings-mode-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 8px;
 }

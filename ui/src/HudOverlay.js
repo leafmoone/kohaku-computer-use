@@ -29,6 +29,111 @@ const POPOVER_ESTIMATED_HEIGHT = 380
 const POPOVER_WIDTH = 344
 const VIEWPORT_MARGIN = 12
 
+function isElementHidden(el) {
+  let cur = el
+  while (cur && cur.nodeType === 1) {
+    if (cur.hidden === true || (typeof cur.hasAttribute === "function" && cur.hasAttribute("hidden"))) {
+      return true
+    }
+    if (typeof cur.getAttribute === "function") {
+      if (cur.getAttribute("aria-hidden") === "true") return true
+      if (cur.getAttribute("data-collapsed") === "true") return true
+    }
+    const inlineDisplay = cur.style ? cur.style.display : ""
+    const inlineVisibility = cur.style ? cur.style.visibility : ""
+    if (inlineDisplay === "none" || inlineVisibility === "hidden") return true
+    if (!inlineDisplay && typeof cur.getAttribute === "function") {
+      const rawStyle = cur.getAttribute("style")
+      if (
+        rawStyle &&
+        (/\bdisplay\s*:\s*none\b/i.test(rawStyle) || /\bvisibility\s*:\s*hidden\b/i.test(rawStyle))
+      ) {
+        return true
+      }
+    }
+    if (typeof window !== "undefined" && typeof window.getComputedStyle === "function") {
+      const computedStyle = window.getComputedStyle(cur)
+      if (
+        computedStyle &&
+        (computedStyle.display === "none" || computedStyle.visibility === "hidden")
+      ) {
+        return true
+      }
+    }
+    cur = cur.parentElement
+  }
+  return false
+}
+
+function lcaDepth(nodeA, nodeB) {
+  if (!nodeA || !nodeB) return -1
+  const ancestors = new Map()
+  let cur = nodeA
+  const chain = []
+  while (cur && cur.nodeType === 1) {
+    chain.push(cur)
+    cur = cur.parentElement
+  }
+  const total = chain.length
+  for (let i = 0; i < total; i++) {
+    ancestors.set(chain[i], total - i)
+  }
+  let probe = nodeB
+  while (probe && probe.nodeType === 1) {
+    if (ancestors.has(probe)) return ancestors.get(probe)
+    probe = probe.parentElement
+  }
+  return -1
+}
+
+function findVisibleDockCapsule(doc, preferredTarget) {
+  if (!doc || typeof doc.querySelectorAll !== "function") return null
+  const rawList = [...doc.querySelectorAll(DOCK_CAPSULE_SELECTOR)]
+  const candidates = []
+  for (const capsule of rawList) {
+    if (isElementHidden(capsule)) continue
+    candidates.push(capsule)
+  }
+  if (candidates.length === 0) return null
+
+  const measured = candidates.map((el) => ({
+    el,
+    rect: typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null,
+  }))
+  const bodyRect =
+    doc.body && typeof doc.body.getBoundingClientRect === "function"
+      ? doc.body.getBoundingClientRect()
+      : null
+  const hasRealGeometry = Boolean(
+    (bodyRect && bodyRect.width > 0 && bodyRect.height > 0) ||
+      measured.some((item) => item.rect && item.rect.width > 0 && item.rect.height > 0),
+  )
+  const visible = hasRealGeometry
+    ? measured
+        .filter((item) => item.rect && item.rect.width > 0 && item.rect.height > 0)
+        .map((item) => item.el)
+    : candidates
+
+  if (visible.length === 0) return null
+  if (visible.length === 1) return visible[0]
+
+  const focusNode =
+    doc.activeElement && doc.activeElement !== doc.body ? doc.activeElement : preferredTarget
+  if (focusNode && focusNode.nodeType === 1) {
+    let bestEl = visible[0]
+    let bestScore = -1
+    for (const candidate of visible) {
+      const score = lcaDepth(candidate, focusNode)
+      if (score > bestScore) {
+        bestScore = score
+        bestEl = candidate
+      }
+    }
+    if (bestScore > 0) return bestEl
+  }
+  return visible[0]
+}
+
 function renderMonitorCursorSvg() {
   return h(
     "svg",
@@ -78,12 +183,16 @@ export default defineComponent({
 
     const dockTarget = shallowRef(null)
     const dockBtnRef = ref(null)
+    const safetyPillRef = ref(null)
+    const pillTriggerRef = ref(null)
+    const popoverAnchor = ref("dock")
     const popoverRef = ref(null)
     const popoverBox = ref({ left: 16, top: 16, width: POPOVER_WIDTH })
 
     let slotHost = null
     let domObserver = null
     let syncScheduled = false
+    let lastInteractedEl = null
 
     const currentStatus = computed(() => store.state.status)
     const modeValue = computed(() =>
@@ -107,20 +216,74 @@ export default defineComponent({
       return slotHost
     }
 
+    function resolveAnchorRect(rawRect, anchorKind) {
+      if (!rawRect || anchorKind !== "pill") return rawRect
+      const centerX = (Number(rawRect.left) + Number(rawRect.right)) / 2
+      return {
+        left: rawRect.left,
+        top: rawRect.top,
+        right: Math.round(centerX + POPOVER_WIDTH / 2),
+        bottom: rawRect.bottom,
+        width: rawRect.width,
+        height: rawRect.height,
+      }
+    }
+
     function updatePopoverPlacement() {
       if (typeof window === "undefined" || !store.state.popoverOpen) return
-      const anchorEl = dockBtnRef.value
-      const anchorRect =
+      const bodyRect =
+        typeof document !== "undefined" &&
+        document.body &&
+        typeof document.body.getBoundingClientRect === "function"
+          ? document.body.getBoundingClientRect()
+          : null
+      const hasRealGeometry = Boolean(bodyRect && bodyRect.width > 0 && bodyRect.height > 0)
+
+      let activeAnchorKind = popoverAnchor.value
+      let anchorEl =
+        activeAnchorKind === "pill"
+          ? safetyPillRef.value || pillTriggerRef.value
+          : dockBtnRef.value
+      let anchorRect =
         anchorEl && typeof anchorEl.getBoundingClientRect === "function"
           ? anchorEl.getBoundingClientRect()
           : null
+
+      const invalidAnchor =
+        !anchorEl ||
+        isElementHidden(anchorEl) ||
+        (hasRealGeometry && (!anchorRect || anchorRect.width <= 0 || anchorRect.height <= 0))
+
+      if (invalidAnchor && activeAnchorKind === "dock" && showSafetyPill.value) {
+        const pillFallback = safetyPillRef.value || pillTriggerRef.value
+        const pillRect =
+          pillFallback && typeof pillFallback.getBoundingClientRect === "function"
+            ? pillFallback.getBoundingClientRect()
+            : null
+        const pillValid =
+          pillFallback &&
+          !isElementHidden(pillFallback) &&
+          (!hasRealGeometry || (pillRect && pillRect.width > 0 && pillRect.height > 0))
+        if (pillValid) {
+          activeAnchorKind = "pill"
+          anchorEl = pillFallback
+          anchorRect = pillRect
+        } else {
+          store.setPopoverOpen(false)
+          return
+        }
+      } else if (invalidAnchor) {
+        store.setPopoverOpen(false)
+        return
+      }
+
       const popEl = popoverRef.value
       const measuredHeight =
         popEl && typeof popEl.getBoundingClientRect === "function"
           ? Math.max(200, popEl.getBoundingClientRect().height)
           : POPOVER_ESTIMATED_HEIGHT
       popoverBox.value = clampPopoverPosition(
-        anchorRect,
+        resolveAnchorRect(anchorRect, activeAnchorKind),
         POPOVER_WIDTH,
         measuredHeight,
         window.innerWidth,
@@ -134,7 +297,7 @@ export default defineComponent({
       if (document.querySelector(SETTINGS_NAV_SELECTOR)) {
         syncSettingsHostLabels(locale.value, document)
       }
-      const capsuleEl = document.querySelector(DOCK_CAPSULE_SELECTOR)
+      const capsuleEl = findVisibleDockCapsule(document, lastInteractedEl)
       if (!capsuleEl) {
         if (slotHost && slotHost.parentElement) {
           slotHost.remove()
@@ -142,7 +305,7 @@ export default defineComponent({
         if (dockTarget.value !== null) {
           dockTarget.value = null
         }
-        if (store.state.popoverOpen) {
+        if (store.state.popoverOpen && popoverAnchor.value === "dock") {
           store.setPopoverOpen(false)
         }
         return
@@ -172,6 +335,28 @@ export default defineComponent({
       if (event && typeof event.stopPropagation === "function") {
         event.stopPropagation()
       }
+      if (store.state.popoverOpen && popoverAnchor.value !== "dock") {
+        popoverAnchor.value = "dock"
+        void nextTick().then(updatePopoverPlacement)
+        return
+      }
+      popoverAnchor.value = "dock"
+      store.togglePopover()
+      if (store.state.popoverOpen) {
+        void nextTick().then(updatePopoverPlacement)
+      }
+    }
+
+    function onPillModeClick(event) {
+      if (event && typeof event.stopPropagation === "function") {
+        event.stopPropagation()
+      }
+      if (store.state.popoverOpen && popoverAnchor.value !== "pill") {
+        popoverAnchor.value = "pill"
+        void nextTick().then(updatePopoverPlacement)
+        return
+      }
+      popoverAnchor.value = "pill"
       store.togglePopover()
       if (store.state.popoverOpen) {
         void nextTick().then(updatePopoverPlacement)
@@ -179,11 +364,24 @@ export default defineComponent({
     }
 
     function onDocumentPointerDown(event) {
-      if (!store.state.popoverOpen) return
       const target = event ? event.target : null
+      if (target && target.nodeType === 1) {
+        lastInteractedEl = target
+        scheduleSync()
+      }
+      if (!store.state.popoverOpen) return
       if (popoverRef.value && target && popoverRef.value.contains(target)) return
       if (dockBtnRef.value && target && dockBtnRef.value.contains(target)) return
+      if (pillTriggerRef.value && target && pillTriggerRef.value.contains(target)) return
       store.setPopoverOpen(false)
+    }
+
+    function onDocumentFocusIn(event) {
+      const target = event ? event.target : null
+      if (target && target.nodeType === 1) {
+        lastInteractedEl = target
+        scheduleSync()
+      }
     }
 
     function onWindowKeyDown(event) {
@@ -234,10 +432,16 @@ export default defineComponent({
           }
           scheduleSync()
         })
-        domObserver.observe(document.body, { childList: true, subtree: true })
+        domObserver.observe(document.body, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["style", "class", "hidden", "aria-hidden", "data-collapsed"],
+        })
       }
       if (typeof document !== "undefined") {
         document.addEventListener("pointerdown", onDocumentPointerDown, true)
+        document.addEventListener("focusin", onDocumentFocusIn, true)
       }
       if (typeof window !== "undefined") {
         window.addEventListener("keydown", onWindowKeyDown, true)
@@ -256,6 +460,7 @@ export default defineComponent({
       }
       if (typeof document !== "undefined") {
         document.removeEventListener("pointerdown", onDocumentPointerDown, true)
+        document.removeEventListener("focusin", onDocumentFocusIn, true)
       }
       if (typeof window !== "undefined") {
         window.removeEventListener("keydown", onWindowKeyDown, true)
@@ -285,14 +490,29 @@ export default defineComponent({
       return h(
         "div",
         {
+          ref: safetyPillRef,
           class: `kcu-safety-pill kcu-state-${tone.value}`,
           "data-test": "kcu-safety-pill",
           role: "status",
           "aria-live": "polite",
         },
         [
-          h("span", { class: "kcu-pill-dot", "aria-hidden": "true" }),
-          h("span", { class: "kcu-pill-state" }, stateLabel.value),
+          h(
+            "button",
+            {
+              ref: pillTriggerRef,
+              type: "button",
+              class: "kcu-pill-mode-btn",
+              "data-test": "kcu-pill-mode-trigger",
+              "aria-expanded": String(store.state.popoverOpen && popoverAnchor.value === "pill"),
+              title: t("popover.modeLabel"),
+              onClick: onPillModeClick,
+            },
+            [
+              h("span", { class: "kcu-pill-dot", "aria-hidden": "true" }),
+              h("span", { class: "kcu-pill-state" }, stateLabel.value),
+            ],
+          ),
           h("span", { class: "kcu-pill-meta" }, contextText),
           idleText ? h("span", { class: "kcu-pill-timer" }, idleText) : null,
           h("div", { class: "kcu-pill-actions" }, [
@@ -452,15 +672,34 @@ export default defineComponent({
             ]),
             h("div", { class: "kcu-kv-row" }, [
               h("span", { class: "kcu-kv-key" }, t("popover.idleLabel")),
-              h("span", { class: "kcu-kv-val" }, idleSummary),
+              h("label", { class: "kcu-switch-inline" }, [
+                h("input", {
+                  type: "checkbox",
+                  class: "kcu-checkbox",
+                  "data-test": "kcu-popover-idle-toggle",
+                  checked: Boolean(status && status.idle_timeout_s > 0),
+                  disabled: store.state.savingPolicy || !supported,
+                  onChange: (event) =>
+                    void store.toggleIdleAutoLock(
+                      Boolean(event && event.target && event.target.checked),
+                    ),
+                }),
+                h("span", { class: "kcu-kv-val" }, idleSummary),
+              ]),
             ]),
             h("div", { class: "kcu-kv-row" }, [
               h("span", { class: "kcu-kv-key" }, t("popover.hotkeyLabel")),
               h(
                 "span",
-                { class: "kcu-kv-val" },
+                { class: "kcu-kv-val", "data-test": "kcu-popover-hotkey-val" },
                 status
-                  ? `${status.hotkey} (${status.hotkey_registered ? t("popover.hotkeyReady") : t("popover.hotkeyUnavailable")})`
+                  ? `${status.hotkey} (${
+                      status.hotkey_registered
+                        ? t("popover.hotkeyReady")
+                        : modeValue.value === "locked"
+                          ? t("popover.hotkeyStandby")
+                          : t("popover.hotkeyUnavailable")
+                    })`
                   : "Ctrl+Alt+F12",
               ),
             ]),
@@ -482,7 +721,6 @@ export default defineComponent({
                 type: "button",
                 class: "kcu-btn kcu-btn-sm kcu-btn-danger",
                 "data-test": "kcu-popover-panic",
-                disabled: store.state.savingPolicy,
                 onClick: () => void store.triggerPanic("ui_emergency_lock"),
               },
               t("popover.emergencyLock"),

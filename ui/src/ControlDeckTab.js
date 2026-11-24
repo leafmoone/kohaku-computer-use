@@ -144,6 +144,12 @@ export default defineComponent({
       const status = currentStatus.value
       const stats = status && status.stats ? status.stats : { observations: 0, actions: 0, blocked: 0 }
       const fgAllowed = status ? status.allow_foreground_input !== false : true
+      const idleEnabled = Boolean(status && status.idle_timeout_s > 0)
+      const idleSummary = idleEnabled
+        ? status.idle_remaining_s !== null && status.idle_remaining_s !== undefined
+          ? `${formatDurationSeconds(status.idle_remaining_s)} / ${status.idle_timeout_s}s`
+          : `${status.idle_timeout_s}s`
+        : t("popover.idleDisabled")
       const workerAlive = Boolean(status && status.worker_alive)
       const hotkeyText = status && status.hotkey ? status.hotkey : "Ctrl+Alt+F12"
       const lease = status && status.active_lease ? status.active_lease : null
@@ -173,8 +179,22 @@ export default defineComponent({
               ),
               h(
                 "span",
-                { class: "kcu-kpi" },
-                `${hotkeyText} · ${status && status.hotkey_registered ? t("popover.hotkeyReady") : t("popover.hotkeyUnavailable")}`,
+                {
+                  class:
+                    status && status.hotkey_registered
+                      ? "kcu-kpi kcu-kpi-live"
+                      : status && modeValue.value !== "locked"
+                        ? "kcu-kpi kcu-kpi-warn"
+                        : "kcu-kpi",
+                  "data-test": "kcu-deck-hotkey-kpi",
+                },
+                `${hotkeyText} · ${
+                  status && status.hotkey_registered
+                    ? t("popover.hotkeyReady")
+                    : modeValue.value === "locked"
+                      ? t("deck.hotkeyStandby")
+                      : t("popover.hotkeyUnavailable")
+                }`,
               ),
               lease
                 ? h(
@@ -248,6 +268,26 @@ export default defineComponent({
                 fgAllowed ? t("deck.foregroundOn") : t("deck.foregroundOff"),
               ),
             ]),
+            h("div", { class: "kcu-control-group" }, [
+              h("label", { class: "kcu-switch-inline" }, [
+                h("input", {
+                  type: "checkbox",
+                  class: "kcu-checkbox",
+                  "data-test": "kcu-deck-idle-toggle",
+                  checked: idleEnabled,
+                  disabled: store.state.savingPolicy || !supportedValue.value,
+                  onChange: (event) =>
+                    void store.toggleIdleAutoLock(
+                      Boolean(event && event.target && event.target.checked),
+                    ),
+                }),
+                h(
+                  "span",
+                  { class: "kcu-control-label" },
+                  `${t("popover.idleLabel")}: ${idleSummary}`,
+                ),
+              ]),
+            ]),
             h("div", { class: "kcu-stats-row" }, [
               h("span", { class: "kcu-stat-chip" }, t("deck.statsObservations", { count: stats.observations })),
               h("span", { class: "kcu-stat-chip" }, t("deck.statsActions", { count: stats.actions })),
@@ -273,7 +313,6 @@ export default defineComponent({
                   type: "button",
                   class: "kcu-btn kcu-btn-sm kcu-btn-danger",
                   "data-test": "kcu-deck-panic",
-                  disabled: store.state.savingPolicy,
                   onClick: () => void store.triggerPanic("deck_emergency_lock"),
                 },
                 t("deck.emergencyLock"),
