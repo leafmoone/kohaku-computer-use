@@ -56,6 +56,7 @@
   "deck.tagDenylisted": "黑名单",
   "deck.denylistedNotice": "所选窗口命中黑名单规则，已被禁止代理访问。",
   "deck.refreshWindows": "刷新窗口",
+  "deck.restoreMinimizedLabel": "自动唤醒最小化",
   "deck.observeSemantic": "语义观察",
   "deck.observeFrame": "带画面观察",
   "deck.observing": "观察中...",

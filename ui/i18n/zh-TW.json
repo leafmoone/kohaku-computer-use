@@ -56,6 +56,7 @@
   "deck.tagDenylisted": "黑名單",
   "deck.denylistedNotice": "所選視窗符合黑名單規則，已被禁止代理存取。",
   "deck.refreshWindows": "重新整理視窗",
+  "deck.restoreMinimizedLabel": "自動喚醒最小化",
   "deck.observeSemantic": "語意觀察",
   "deck.observeFrame": "含畫面觀察",
   "deck.observing": "觀察中...",

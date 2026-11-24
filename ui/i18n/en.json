@@ -56,6 +56,7 @@
   "deck.tagDenylisted": "Denylisted",
   "deck.denylistedNotice": "Selected window matches the denylist and is blocked from agent control.",
   "deck.refreshWindows": "Refresh Windows",
+  "deck.restoreMinimizedLabel": "Restore minimized",
   "deck.observeSemantic": "Observe Semantic",
   "deck.observeFrame": "Observe with Frame",
   "deck.observing": "Observing...",

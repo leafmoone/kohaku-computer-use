@@ -384,6 +384,20 @@ export default defineComponent({
               ],
             ),
             h("div", { class: "kcu-target-buttons" }, [
+              h("label", { class: "kcu-switch-inline" }, [
+                h("input", {
+                  type: "checkbox",
+                  class: "kcu-checkbox",
+                  "data-test": "kcu-deck-restore-toggle",
+                  checked: Boolean(store.state.restoreOnObserve),
+                  disabled: !supportedValue.value || store.state.loadingObserve,
+                  onChange: (event) =>
+                    store.setRestoreOnObserve(
+                      Boolean(event && event.target && event.target.checked),
+                    ),
+                }),
+                h("span", { class: "kcu-control-label" }, t("deck.restoreMinimizedLabel")),
+              ]),
               h(
                 "button",
                 {

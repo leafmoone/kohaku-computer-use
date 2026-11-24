@@ -1,0 +1,18 @@
+name: cu_operator
+base_config: "@kt-biome/creatures/general"
+controller:
+  reasoning_effort: low
+  include_hints_in_prompt: false
+tool_doc_mode: standard
+no_inherit: [tools, plugins, subagents, skills, mcp_servers, prompt_context_files]
+prompt_mode: replace
+system_prompt_file: prompts/system.md
+tools:
+  - {name: info, type: builtin}
+  - {name: ask_user, type: builtin}
+  - {name: show_card, type: builtin}
+plugins:
+  - name: computer_use
+    type: package
+    module: kohaku_computer_use.plugin
+    class: ComputerUsePlugin

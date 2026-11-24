@@ -55,6 +55,7 @@ log = logging.getLogger(__name__)
 CALL_TIMEOUT = 12.0
 HOTKEY_READY_TIMEOUT = 2.5
 OPERATOR = 'operator'
+DELEGATE_CANCEL = 'computer_use.delegate_cancel'
 
 
 class BrokerError(Exception):
@@ -88,6 +89,13 @@ def action_key(actions: list[Action]) -> str:
 
 def public_root(root: WorkerRoot) -> RootItem:
     return {key: deepcopy(value) for key, value in root.items() if key != 'exe_path'}
+
+
+def window_rank(root: WorkerRoot) -> tuple[bool, bool, bool, int]:
+    width, height = root['rect']['width'], root['rect']['height']
+    minimized = root['is_minimized']
+    tiny = not minimized and (width < 80 or height < 60)
+    return not tiny, root['is_foreground'], not minimized, width * height
 
 
 def action_needs_confirmation(snapshot: Snapshot, actions: list[Action]) -> bool:
@@ -490,6 +498,9 @@ class DesktopBroker:
         if not self.supported:
             raise BrokerError(501, 'unsupported_platform', 'blocked')
         if context is not None:
+            cancelled = context.runtime_services.get(DELEGATE_CANCEL)
+            if cancelled is not None and cancelled.is_set():
+                raise BrokerError(409, 'desktop_delegate_cancelled', 'blocked')
             actor = actor_for(context)
             if not _plugin_enabled(context.agent):
                 raise BrokerError(403, 'computer_use_plugin_disabled', 'blocked')
@@ -514,7 +525,7 @@ class DesktopBroker:
         snapshot = self._find_state(state_id)
         self._check_root(snapshot.root)
         if mutate and snapshot.root['is_elevated']:
-            raise BrokerError(403, 'elevated_or_unverified_target', 'blocked')
+            raise BrokerError(403, 'elevated_target', 'blocked')
         return snapshot
 
     def _fresh(self, root: WorkerRoot, guard: Callable[[], None]) -> WorkerRoot:
@@ -565,7 +576,8 @@ class DesktopBroker:
                 with self.lock:
                     self._finish_locked_read()
 
-    def _target(self, root_ref: str | None, hwnd: int | None, guard: Callable[[], None]) -> WorkerRoot:
+    def _target(self, root_ref: str | None, hwnd: int | None, query: str | None,
+                guard: Callable[[], None]) -> WorkerRoot:
         with self.lock:
             guard()
             if root_ref:
@@ -576,10 +588,21 @@ class DesktopBroker:
                 root = None
         if root is None:
             roots = self._list(guard)
-            root = next((item for item in roots if item['hwnd'] == hwnd or (hwnd is None and item['is_foreground'])), None)
-            if root is None:
-                raise BrokerError(404, 'no_matching_root', 'blocked')
-        return self._fresh(root, guard)
+            if hwnd is None and query is not None:
+                needle = query.casefold()
+                root = max((item for item in roots if not item['denylisted'] and item['exe_path']
+                            and any(needle in item[key].casefold() for key in ('title', 'exe_name'))),
+                           key=window_rank, default=None)
+                if root is None:
+                    raise BrokerError(404, 'window_not_found', 'blocked')
+            else:
+                root = next((item for item in roots if item['hwnd'] == hwnd or (hwnd is None and item['is_foreground'])), None)
+                if root is None:
+                    raise BrokerError(404, 'no_matching_root', 'blocked')
+        with self.lock:
+            guard()
+            self._check_root(root)
+        return root
 
     def precheck(self, context: ToolContext, tool: str, args: dict):
         actor_for(context)
@@ -587,9 +610,8 @@ class DesktopBroker:
             self._gate(context, tool == 'cu_act')
             if tool == 'cu_query':
                 self._resolve_state(context, args['state_id'], False)
-        if tool == 'cu_observe':
-            with self.calls:
-                self._target(args.get('root_ref'), args.get('hwnd'), lambda: self._gate(context, False))
+            if tool == 'cu_observe' and (root := self.roots.get(args.get('root_ref'))) is not None:
+                self._check_root(root)
 
     def approval_preview(self, context: ToolContext, state_id: str, actions: list[Action]) -> tuple[bool, str, int]:
         def guard():
@@ -670,16 +692,17 @@ class DesktopBroker:
                      f'Observed {detail["element_count"]} elements', 'worked')
         return snapshot
 
-    def _capture(self, root: WorkerRoot, include_image: bool, max_elements: int, guard: Callable[[], None]) -> WorkerSnapshot:
+    def _capture(self, root: WorkerRoot, include_image: bool, max_elements: int, restore: bool,
+                 guard: Callable[[], None]) -> WorkerSnapshot:
         with self.lock:
             guard()
             request = {'id': 0, 'op': 'observe', 'identity': identity(root), 'root_ref': root['root_ref'],
-                       'include_image': include_image, 'max_elements': max_elements,
+                       'include_image': include_image, 'max_elements': max_elements, 'restore': restore,
                        'denylist_patterns': list(self.policy.denylist_patterns)}
         return self._rpc(request, guard)
 
     def observe(self, context: ToolContext | None, root_ref: str | None, hwnd: int | None,
-                include_image: bool, max_elements: int) -> tuple[StateDetail, bytes | None]:
+                include_image: bool, max_elements: int, query: str | None, restore: bool) -> tuple[StateDetail, bytes | None]:
         actor = actor_for(context) if context is not None else None
         label = actor.agent_name if actor else OPERATOR
         with self.calls:
@@ -694,8 +717,8 @@ class DesktopBroker:
                     raise BrokerError(409, 'desktop_policy_or_lease_changed', 'blocked')
 
             try:
-                root = self._target(root_ref, hwnd, guard)
-                result = self._capture(root, include_image, max_elements, guard)
+                root = self._target(root_ref, hwnd, query, guard)
+                result = self._capture(root, include_image, max_elements, restore, guard)
                 with self.lock:
                     guard()
                     snapshot = self._store(result, max_elements, actor, None)
@@ -758,7 +781,7 @@ class DesktopBroker:
                 def dispatch_guard():
                     guard()
                     if current['is_elevated']:
-                        raise BrokerError(403, 'elevated_or_unverified_target', 'blocked')
+                        raise BrokerError(403, 'elevated_target', 'blocked')
                     must_confirm = self.policy.mode == 'confirm' or (
                         action_needs_confirmation(snapshot, actions)
                         and not matches_patterns(current, self.policy.allowlist_patterns)
@@ -810,7 +833,7 @@ class DesktopBroker:
                     raise BrokerError(409, 'desktop_policy_or_lease_changed', 'blocked')
 
             try:
-                result = self._capture(current, bool(snapshot.png), snapshot.max_elements, post_guard)
+                result = self._capture(current, bool(snapshot.png), snapshot.max_elements, False, post_guard)
                 with self.lock:
                     post_guard()
                     post = self._state(self._store(result, snapshot.max_elements, actor, last_dispatched))

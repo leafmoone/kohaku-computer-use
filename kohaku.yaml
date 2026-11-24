@@ -8,6 +8,9 @@ plugins:
   - name: computer_use
     module: kohaku_computer_use.plugin
     class: ComputerUsePlugin
+creatures:
+  - name: cu_operator
+    description: A lean Windows desktop operator for observation and batched actions.
 ui:
   sdk: ">=1.2,<2"
   root: ui

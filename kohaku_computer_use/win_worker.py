@@ -1,7 +1,7 @@
 """Windows child process; only the windowless MTA thread touches UI Automation."""
 import ctypes as c
 
-if hasattr(c, 'WinDLL'):
+if __name__ == '__main__' and hasattr(c, 'WinDLL'):
     _early_user = c.WinDLL('user32', use_last_error=True)
     _dpi = _early_user.SetProcessDpiAwarenessContext
     _dpi.argtypes = [c.c_void_p]
@@ -103,6 +103,11 @@ class Native:
         self.thread = bind(u, 'GetWindowThreadProcessId', D, HWND, P(D))
         self.foreground = bind(u, 'GetForegroundWindow', HWND)
         self.set_foreground = bind(u, 'SetForegroundWindow', B, HWND)
+        self.show_window = bind(u, 'ShowWindow', B, HWND, I)
+        self.bring_to_top = bind(u, 'BringWindowToTop', B, HWND)
+        self.attach_input = bind(u, 'AttachThreadInput', B, D, D, B)
+        self.current_thread = bind(k, 'GetCurrentThreadId', D)
+        self.peek_message = bind(u, 'PeekMessageW', B, P(w.MSG), HWND, UINT, UINT, UINT)
         self.at_point = bind(u, 'WindowFromPoint', HWND, w.POINT)
         self.metrics = bind(u, 'GetSystemMetrics', I, I)
         self.send_input = bind(u, 'SendInput', UINT, UINT, P(Input), I)
@@ -150,6 +155,43 @@ class Native:
         pid = D()
         self.thread(hwnd, c.byref(pid))
         return pid.value
+
+    def activate_foreground(self, hwnd, allow_alt):
+        if self.minimized(hwnd):
+            self.show_window(hwnd, 9)
+        if self.foreground() == hwnd:
+            return True
+        self.bring_to_top(hwnd)
+        self.set_foreground(hwnd)
+        foreground = self.foreground()
+        if foreground == hwnd:
+            return True
+        # AttachThreadInput requires a message queue on the windowless caller.
+        self.peek_message(c.byref(w.MSG()), None, 0, 0, 0)
+        current = self.current_thread()
+        attached = []
+        try:
+            for window in (foreground, hwnd):
+                thread = self.thread(window, None) if window else 0
+                if thread and thread != current and thread not in attached and self.attach_input(current, thread, True):
+                    attached.append(thread)
+            self.bring_to_top(hwnd)
+            self.set_foreground(hwnd)
+            if allow_alt and self.foreground() != hwnd:
+                self.activation_input_sent = True
+                self.inject([Input(kind=1, keyboard=KeyboardInput(0x12, 0, flag, 0, 0)) for flag in (0, 2)])
+                self.set_foreground(hwnd)
+        finally:
+            detach_error = None
+            for thread in reversed(attached):
+                if not self.attach_input(current, thread, False):
+                    detach_error = c.get_last_error()
+            if detach_error is not None:
+                raise c.WinError(detach_error)
+        deadline = time.monotonic() + 0.15
+        while self.foreground() != hwnd and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return self.foreground() == hwnd
 
     def window_rect(self, hwnd):
         rect = w.RECT()
@@ -466,16 +508,35 @@ class Automation:
             return choices[0]
         raise WorkerError('stale_or_ambiguous_element')
 
+    def restore_window(self, request, root, allow_alt):
+        hwnd = root['hwnd']
+        self.native.show_window(hwnd, 9)
+        self.native.activate_foreground(hwnd, allow_alt)
+        deadline = time.monotonic() + 0.25
+        while True:
+            current = self.checked_root(request)
+            if not current['is_minimized'] and current['rect']['width'] > 0 and current['rect']['height'] > 0:
+                return current
+            if time.monotonic() >= deadline:
+                raise WorkerError('window_restore_failed')
+            time.sleep(0.015)
+
     def observe(self, request):
         root = self.checked_root(request)
+        if request.get('restore') and root['is_minimized'] and not root['is_elevated']:
+            root = self.restore_window(request, root, False)
         root_element = self.uia.ElementFromHandle(root['hwnd'])
         elements = [self.describe(element, index, depth, truncated)
                     for index, (element, depth, truncated) in enumerate(self.walk(root_element, request['max_elements'], 10), 1)]
-        if not elements:
-            raise WorkerError('uia_root_unavailable')
+        rect = root['rect']
+        sparse = rect['width'] >= 120 and rect['height'] >= 80 and sum(
+            bool(row['depth'] and (row['name'].strip() or row['value_preview'].strip())) for row in elements
+        ) < 2
         png, width, height, method = None, None, None, None
-        if request['include_image']:
+        if request['include_image'] or sparse:
             png, width, height, method = self.native.capture(root)
+        if not elements and not png:
+            raise WorkerError('uia_root_unavailable')
         current = self.checked_root(request)
         if current['rect'] != root['rect'] or current['dpi_scale'] != root['dpi_scale']:
             raise WorkerError('window_geometry_changed')
@@ -519,12 +580,14 @@ class Automation:
             return None
         return bounds['x'] + bounds['width'] // 2, bounds['y'] + bounds['height'] // 2
 
-    def preflight(self, request, root, point, target):
+    def preflight(self, request, root, point, target, no_activate):
         hwnd = root['hwnd']
         current = self.checked_root(request)
         if current['rect'] != root['rect'] or current['dpi_scale'] != root['dpi_scale']:
             raise WorkerError('window_geometry_changed')
-        if current['is_elevated'] or current['is_minimized'] or self.native.foreground() != hwnd:
+        if current['is_elevated']:
+            raise WorkerError('elevated_target')
+        if current['is_minimized'] or (not no_activate and self.native.foreground() != hwnd):
             raise WorkerError('foreground_not_verified')
         if point is None or not contains(root['rect'], *point):
             raise WorkerError('point_outside_target')
@@ -532,10 +595,18 @@ class Automation:
         hit = self.native.at_point(native_point)
         if not hit or self.native.ancestor(hit, 2) != hwnd or self.native.pid(hit) != root['pid']:
             raise WorkerError('occluded_target')
-        element = self.uia.ElementFromPoint(self.module.tagPOINT(*point))
-        if not element or element.CurrentProcessId != root['pid']:
-            raise WorkerError('occluded_target')
-        if target:
+        try:
+            element = self.uia.ElementFromPoint(self.module.tagPOINT(*point))
+        except self.com_error as exc:
+            if not no_activate:
+                raise
+            print(f'Non-activating window UIA hit unavailable: {exc}', file=sys.stderr)
+            element = target
+        if element and element.CurrentProcessId != root['pid']:
+            if not no_activate:
+                raise WorkerError('occluded_target')
+            element = target
+        if target and not no_activate:
             candidate = element
             for _ in range(64):
                 if not candidate:
@@ -547,7 +618,7 @@ class Automation:
                 candidate = None
             if not candidate:
                 raise WorkerError('occluded_target')
-        if self.native.foreground() != hwnd:
+        if not no_activate and self.native.foreground() != hwnd:
             raise WorkerError('foreground_not_verified')
         return current, element
 
@@ -563,59 +634,61 @@ class Automation:
             current = self.uia.RawViewWalker.GetParentElement(current)
         raise WorkerError('target_focus_not_verified')
 
-    def prepare_foreground(self, request, root, element, action, point):
+    def prepare_foreground(self, request, root, element, action):
         if not request['allow_foreground_input']:
             raise WorkerError('foreground_input_disabled')
-        if root['is_elevated'] or root['is_minimized']:
-            raise WorkerError('elevated_or_minimized_target')
-        if 'x' in action and (root['rect'] != request['foreground_rect'] or root['dpi_scale'] != request['foreground_dpi']):
+        self.authorize_live(request, root, action, element)
+        if root['is_elevated']:
+            raise WorkerError('elevated_target')
+        if 'x' in action and (root['is_minimized'] or root['rect'] != request['foreground_rect']
+                              or root['dpi_scale'] != request['foreground_dpi']):
             raise WorkerError('window_geometry_changed')
-        self.authorize_live(request, self.checked_root(request), action, element)
-        hwnd = root['hwnd']
-        if self.native.foreground() != hwnd:
-            self.native.set_foreground(hwnd)
-            if self.native.foreground() != hwnd:
-                raise WorkerError('foreground_not_verified')
         name = action['action']
         keys = name in ('type_text', 'set_text', 'key', 'expand', 'collapse')
-        if not keys or element:
-            current, hit = self.preflight(request, root, point, element)
+        hwnd = root['hwnd']
+        no_activate = not keys and bool(self.native.style(hwnd, -20) & 0x08000000)
+        if root['is_minimized']:
+            root = self.restore_window(request, root, not no_activate)
+        elif not no_activate and not self.native.activate_foreground(hwnd, True):
+            raise WorkerError('foreground_not_verified')
+        point = self.point(element, action, root)
+        if keys and element:
+            element.SetFocus()
+            point = self.focus_point(root, element)
+        if not keys:
+            current, hit = self.preflight(request, root, point, element, no_activate)
             self.authorize_live(request, current, action, hit)
-        focused = None
-        if keys:
-            if element:
-                element.SetFocus()
-            focused = self.uia.GetFocusedElement()
-            if element and not self.uia.CompareElements(element, focused):
-                raise WorkerError('target_focus_not_verified')
-            point = self.focus_point(root, focused)
-            current, hit = self.preflight(request, root, point, focused)
-            self.authorize_live(request, current, action, hit)
-        return point, focused
+        else:
+            self.verify_focus(request, root, action, point, element)
+        return root, point
 
-    def foreground_action(self, request, root, action, point, focused, target):
+    def foreground_action(self, request, root, action, point, target):
         name = action['action']
-        if focused:
-            self.verify_focus(request, root, action, point, focused)
         if name in ('set_text', 'type_text'):
             if action.get('clear_first', name == 'set_text'):
                 self.native.chord('Ctrl+A')
-                self.verify_focus(request, root, action, point, focused)
+                self.verify_focus(request, root, action, point, target)
                 self.native.chord('Backspace')
-                self.verify_focus(request, root, action, point, focused)
+                self.verify_focus(request, root, action, point, target)
             self.native.text(action['text'])
         elif name in ('expand', 'collapse', 'key'):
             self.native.chord(action.get('key') or ('Right' if name == 'expand' else 'Left'))
         else:
-            current, hit = self.preflight(request, root, point, target)
-            self.authorize_live(request, current, action, hit)
             self.native.mouse(point, action)
 
     def verify_focus(self, request, root, action, point, expected):
+        if expected is None:
+            current = self.checked_root(request)
+            if current['is_elevated']:
+                raise WorkerError('elevated_target')
+            if current['is_minimized'] or self.native.foreground() != root['hwnd']:
+                raise WorkerError('foreground_not_verified')
+            self.authorize_live(request, current, action, None)
+            return
         focused = self.uia.GetFocusedElement()
         if not focused or not self.uia.CompareElements(expected, focused) or self.focus_point(root, focused) != point:
             raise WorkerError('target_focus_not_verified')
-        current, hit = self.preflight(request, root, point, focused)
+        current, hit = self.preflight(request, root, point, focused, False)
         self.authorize_live(request, current, action, hit)
 
     def check_expect(self, request, expect):
@@ -648,16 +721,21 @@ class Automation:
     def act(self, request):
         results = []
         stored = {element['ref']: element for element in request['elements']}
-        for action in request['actions']:
+        actions = request['actions']
+        for index, action in enumerate(actions):
             name, ref = action['action'], action.get('ref')
             report = {'action': name, 'ref': ref, 'point': None, 'method': None, 'outcome': 'blocked', 'reason': None}
             results.append(report)
             dispatched = False
+            self.native.activation_input_sent = False
             try:
                 root = self.checked_root(request)
                 if root['is_elevated']:
-                    raise WorkerError('elevated_or_unverified_target')
-                root_element = self.uia.ElementFromHandle(root['hwnd'])
+                    raise WorkerError('elevated_target')
+                if ref and root['is_minimized'] and request['allow_foreground_input'] and name not in PATTERN_ACTIONS:
+                    self.authorize_live(request, root, action, None)
+                    root = self.restore_window(request, root, True)
+                root_element = self.uia.ElementFromHandle(root['hwnd']) if ref or name in PATTERN_ACTIONS else None
                 element = self.find(root_element, stored[ref], request['max_elements']) if ref else None
                 if element and (not element.CurrentIsEnabled or element.CurrentProcessId != root['pid']):
                     raise WorkerError('element_disabled_or_foreign')
@@ -672,7 +750,7 @@ class Automation:
                 if pattern or (legacy and legacy.CurrentDefaultAction):
                     current = self.checked_root(request)
                     if current['is_elevated']:
-                        raise WorkerError('elevated_or_unverified_target')
+                        raise WorkerError('elevated_target')
                     self.authorize_live(request, current, action, target)
                     if name == 'set_text' and pattern.CurrentIsReadOnly:
                         raise WorkerError('element_read_only')
@@ -684,16 +762,21 @@ class Automation:
                         legacy.DoDefaultAction()
                         report['outcome'] = 'unknown'
                 else:
-                    point, focused = self.prepare_foreground(request, root, element, action, point)
+                    root, point = self.prepare_foreground(request, root, element, action)
                     report['point'], report['method'] = point, 'SendInput'
                     dispatched = True
-                    self.foreground_action(request, root, action, point, focused, element)
+                    self.foreground_action(request, root, action, point, element)
                     report['outcome'] = 'unknown'
+                default_wait = 40 if index + 1 < len(actions) and name in ('click', 'double_click', 'right_click', 'invoke') else 0
+                if wait_ms := action.get('wait_ms', default_wait):
+                    time.sleep(wait_ms / 1000)
                 self.checked_root(request)
                 if 'expect' in action:
                     report['outcome'] = self.check_expect(request, action['expect'])
             except (WorkerError, self.com_error, OSError) as exc:
-                report['outcome'] = 'unknown' if dispatched else 'blocked'
+                if self.native.activation_input_sent and report['method'] is None:
+                    report['method'] = 'SendInput'
+                report['outcome'] = 'unknown' if dispatched or self.native.activation_input_sent else 'blocked'
                 report['reason'] = str(exc) if isinstance(exc, WorkerError) else type(exc).__name__
                 break
             if report['outcome'] == 'didnt':

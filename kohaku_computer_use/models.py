@@ -166,6 +166,7 @@ class Action(TypedDict):
     clear_first: NotRequired[bool]
     direction: NotRequired[Literal['up', 'down', 'left', 'right']]
     amount: NotRequired[int]
+    wait_ms: NotRequired[int]
     expect: NotRequired[Expect]
 
 
@@ -190,6 +191,7 @@ class WorkerRequest(TypedDict):
     hwnd: NotRequired[int]
     root_ref: NotRequired[str]
     include_image: NotRequired[bool]
+    restore: NotRequired[bool]
     max_elements: NotRequired[int]
     actions: NotRequired[list[Action]]
     elements: NotRequired[list[WorkerElement]]

@@ -44,6 +44,7 @@ class ObserveBody(OperatorBody):
     root_ref: Annotated[str, Field(pattern=r'^@r[1-9][0-9]*$', max_length=16)] | None = None
     hwnd: Annotated[int, Field(ge=1, le=2**63 - 1)] | None = None
     include_image: bool = False
+    restore: bool = False
 
 
 def local_broker(service: Annotated[object, Depends(get_service)]) -> DesktopBroker:
@@ -96,7 +97,7 @@ def roots(broker: Desktop) -> dict[str, list[RootItem]]:
 @router.post('/observe')
 def observe(body: ObserveBody, broker: Desktop) -> StateDetail:
     try:
-        detail, _ = broker.observe(None, body.root_ref, body.hwnd, body.include_image, 150)
+        detail, _ = broker.observe(None, body.root_ref, body.hwnd, body.include_image, 150, None, body.restore)
         return detail
     except BrokerError as exc:
         raise http_error(exc) from exc

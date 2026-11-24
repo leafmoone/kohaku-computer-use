@@ -42,6 +42,7 @@ export function createCuStore(kt) {
     loadingStates: false,
     savingPolicy: false,
     lastIdleSeconds: 300,
+    restoreOnObserve: false,
     error: "",
     lastSyncedAt: 0,
     disposed: false,
@@ -396,6 +397,7 @@ export function createCuStore(kt) {
       root_ref: trimmedRef,
       hwnd: matchedRoot ? matchedRoot.hwnd : null,
       include_image: Boolean(includeImage),
+      restore: Boolean(state.restoreOnObserve),
     }
     state.loadingObserve = true
     try {
@@ -522,6 +524,10 @@ export function createCuStore(kt) {
     state.hoveredElementRef = ref ? String(ref) : null
   }
 
+  function setRestoreOnObserve(enabled) {
+    state.restoreOnObserve = Boolean(enabled)
+  }
+
   function frameUrl(stateId, hostUrl) {
     if (!stateId) return ""
     const pkg = encodeURIComponent(kt.package || "kohaku-computer-use")
@@ -595,6 +601,7 @@ export function createCuStore(kt) {
     leaveSettings,
     setSelectedElement,
     setHoveredElement,
+    setRestoreOnObserve,
     isPollingActive: () => pollTimer !== null,
     dispose,
   }
