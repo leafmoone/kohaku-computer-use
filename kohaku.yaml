@@ -1,5 +1,9 @@
 name: kohaku-computer-use
 version: 0.1.0
+framework: ">=2.2.3,<3.0.0"
+license: MIT
+author: leafmoone
+repository: https://github.com/leafmoone/kohaku-computer-use
 description: >-
   State-scoped Windows UI Automation and guarded desktop control for KohakuTerrarium.
 python_dependencies:

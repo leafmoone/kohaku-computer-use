@@ -50,3 +50,7 @@ For native Windows input, multi-character and Unicode typing uses a temporary cl
 Example actions: `{"action":"invoke","ref":"@e4"}`; `{"action":"set_text","ref":"@e3","text":"Hello"}`; `{"action":"scroll","direction":"down","amount":2}`. Add an `expect` object such as `{"text":"Saved","timeout_ms":2000}` to check the result. The action list stops on a blocked step or failed verified outcome. If a result is `unknown`, re-observe before deciding whether to retry; the input may already have reached the application.
 
 Manual Control Deck observations do not restore minimized windows unless explicitly requested. The Control Deck retains the latest 16 snapshots and 30 audit entries in memory. Screenshot capture may be unavailable for some windows. Deck frames are read through the local REST API; a screenshot explicitly returned as a visual `cu_observe` tool result can be stored as a session artifact. Direct `cu_act` calls return compact text only; `cu_delegate` can use a successor screenshot internally when its model supports images.
+
+## License
+
+Released under the [MIT License](LICENSE). Built as an extension package for [KohakuTerrarium](https://github.com/Kohaku-Lab/KohakuTerrarium).
